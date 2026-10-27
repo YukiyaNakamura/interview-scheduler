@@ -1,0 +1,6 @@
+APP_URL=http://localhost:5180
+TOKEN_ENC_KEY=   # openssl rand -base64 32
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+RESEND_API_KEY=
+EMAIL_FROM=Aiteru <noreply@example.com>

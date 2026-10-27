@@ -1,0 +1,42 @@
+// Cloudflare Worker の設定。構成は docs/01_architecture.md が正。
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "interview-scheduler",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+
+  // 画面（React）のビルド結果を配信する。SPA なので無いパスは index.html を返す。
+  // /api/* と /auth/* は Worker が先に処理する
+  "assets": {
+    "directory": "./dist/web",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/auth/*"]
+  },
+
+  // 定時実行（UTC）。src/worker/index.ts の scheduled() と合わせる
+  "triggers": {
+    "crons": [
+      "*/10 * * * *", // リマインドメール（10分ごと）
+      "0 18 * * *" // 期限切れセッション等の掃除（毎日 03:00 JST）
+    ]
+  },
+
+  // 公開されてよい設定値。秘密情報（GOOGLE_CLIENT_SECRET など）は .dev.vars / wrangler secret に置く
+  "vars": {
+    "APP_NAME": "Aiteru",
+    "EMAIL_PROVIDER": "log"
+  },
+
+  // D1（全データ）。本番は `wrangler d1 create interview-scheduler-db` で作り、database_id を差し替える
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "interview-scheduler-db",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
