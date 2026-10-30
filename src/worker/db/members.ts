@@ -1,18 +1,34 @@
-/** members（面接官）/ oauth_states / calendar_connections へのアクセス */
+/**
+ * members（面接官）/ oauth_states / calendar_connections へのアクセス。
+ * メールアドレスは DB では暗号化して持ち、ここで読み書きするときに復号・暗号化する（lib/pii.ts）
+ */
 import type { ConnectionInfo, MemberInfo } from '../../shared/api';
+import { emailIndex, open, sealEmail } from '../lib/pii';
 import { newId, newToken, nowIso, parseJson } from '../lib/util';
 
 export interface MemberRow {
   id: string;
   name: string;
+  /** 復号したメールアドレス */
   email: string;
   created_at: string;
 }
+
+interface MemberDbRow {
+  id: string;
+  name: string;
+  email_enc: string;
+  email_hash: string;
+  created_at: string;
+}
+
+const toMemberRow = async (r: MemberDbRow): Promise<MemberRow> => ({ id: r.id, name: r.name, email: await open(r.email_enc), created_at: r.created_at });
 
 export interface ConnectionRow {
   id: string;
   member_id: string;
   provider: 'google';
+  /** 復号した Google アカウントのメールアドレス */
   account_email: string;
   refresh_token_enc: string | null;
   access_token_enc: string | null;
@@ -23,6 +39,13 @@ export interface ConnectionRow {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+}
+
+type ConnectionDbRow = Omit<ConnectionRow, 'account_email'> & { account_email_enc: string; account_email_hash: string };
+
+async function toConnectionRow(r: ConnectionDbRow): Promise<ConnectionRow> {
+  const { account_email_enc, account_email_hash: _hash, ...rest } = r;
+  return { ...rest, account_email: await open(account_email_enc) };
 }
 
 export function toConnectionInfo(c: ConnectionRow): ConnectionInfo {
@@ -42,12 +65,13 @@ export function toMemberInfo(m: MemberRow, conns: ConnectionRow[]): MemberInfo {
 }
 
 export async function listMembers(db: D1Database): Promise<MemberRow[]> {
-  const { results } = await db.prepare('SELECT * FROM members ORDER BY created_at').all<MemberRow>();
-  return results;
+  const { results } = await db.prepare('SELECT * FROM members ORDER BY created_at').all<MemberDbRow>();
+  return Promise.all(results.map(toMemberRow));
 }
 
 export async function getMember(db: D1Database, id: string): Promise<MemberRow | null> {
-  return db.prepare('SELECT * FROM members WHERE id = ?').bind(id).first<MemberRow>();
+  const row = await db.prepare('SELECT * FROM members WHERE id = ?').bind(id).first<MemberDbRow>();
+  return row ? toMemberRow(row) : null;
 }
 
 export async function getMembersByIds(db: D1Database, ids: string[]): Promise<MemberRow[]> {
@@ -55,23 +79,25 @@ export async function getMembersByIds(db: D1Database, ids: string[]): Promise<Me
   const { results } = await db
     .prepare(`SELECT * FROM members WHERE id IN (${ids.map(() => '?').join(',')})`)
     .bind(...ids)
-    .all<MemberRow>();
-  return results;
+    .all<MemberDbRow>();
+  return Promise.all(results.map(toMemberRow));
 }
 
 export async function isEmailTaken(db: D1Database, email: string, exceptId?: string): Promise<boolean> {
-  const row = await db.prepare('SELECT id FROM members WHERE email = ?').bind(email).first<{ id: string }>();
+  const row = await db.prepare('SELECT id FROM members WHERE email_hash = ?').bind(await emailIndex(email)).first<{ id: string }>();
   return row !== null && row.id !== exceptId;
 }
 
 export async function insertMember(db: D1Database, name: string, email: string): Promise<string> {
   const id = newId();
-  await db.prepare('INSERT INTO members (id, name, email, created_at) VALUES (?, ?, ?, ?)').bind(id, name, email, nowIso()).run();
+  const e = await sealEmail(email);
+  await db.prepare('INSERT INTO members (id, name, email_enc, email_hash, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, name, e.enc, e.hash, nowIso()).run();
   return id;
 }
 
 export async function updateMember(db: D1Database, id: string, name: string, email: string): Promise<void> {
-  await db.prepare('UPDATE members SET name = ?, email = ? WHERE id = ?').bind(name, email, id).run();
+  const e = await sealEmail(email);
+  await db.prepare('UPDATE members SET name = ?, email_enc = ?, email_hash = ? WHERE id = ?').bind(name, e.enc, e.hash, id).run();
 }
 
 /** メンバーを消す。参加メンバー・連携は外部キーで一緒に消える。担当した予定（booking_hosts）は名前の控えつきで残る */
@@ -100,8 +126,8 @@ export async function consumeOAuthState(db: D1Database, state: string): Promise<
 // ---- 連携カレンダー ----
 
 export async function listAllConnections(db: D1Database): Promise<ConnectionRow[]> {
-  const { results } = await db.prepare('SELECT * FROM calendar_connections ORDER BY created_at').all<ConnectionRow>();
-  return results;
+  const { results } = await db.prepare('SELECT * FROM calendar_connections ORDER BY created_at').all<ConnectionDbRow>();
+  return Promise.all(results.map(toConnectionRow));
 }
 
 export async function listConnectionsForMembers(db: D1Database, memberIds: string[]): Promise<ConnectionRow[]> {
@@ -109,12 +135,13 @@ export async function listConnectionsForMembers(db: D1Database, memberIds: strin
   const { results } = await db
     .prepare(`SELECT * FROM calendar_connections WHERE member_id IN (${memberIds.map(() => '?').join(',')}) ORDER BY created_at`)
     .bind(...memberIds)
-    .all<ConnectionRow>();
-  return results;
+    .all<ConnectionDbRow>();
+  return Promise.all(results.map(toConnectionRow));
 }
 
 export async function getConnection(db: D1Database, id: string): Promise<ConnectionRow | null> {
-  return db.prepare('SELECT * FROM calendar_connections WHERE id = ?').bind(id).first<ConnectionRow>();
+  const row = await db.prepare('SELECT * FROM calendar_connections WHERE id = ?').bind(id).first<ConnectionDbRow>();
+  return row ? toConnectionRow(row) : null;
 }
 
 export async function upsertGoogleConnection(
@@ -124,18 +151,20 @@ export async function upsertGoogleConnection(
   tokens: { accessTokenEnc: string; expiresAt: string; refreshTokenEnc: string | null },
 ): Promise<void> {
   const now = nowIso();
+  const e = await sealEmail(accountEmail);
   // refresh_token は再同意のときしか返らないことがあるので、来なかったら前の値を残す
   await db
     .prepare(
-      `INSERT INTO calendar_connections (id, member_id, provider, account_email, refresh_token_enc, access_token_enc, access_token_expires_at, status, created_at, updated_at)
-       VALUES (?, ?, 'google', ?, ?, ?, ?, 'active', ?, ?)
-       ON CONFLICT (member_id, provider, account_email) DO UPDATE SET
+      `INSERT INTO calendar_connections (id, member_id, provider, account_email_enc, account_email_hash, refresh_token_enc, access_token_enc, access_token_expires_at, status, created_at, updated_at)
+       VALUES (?, ?, 'google', ?, ?, ?, ?, ?, 'active', ?, ?)
+       ON CONFLICT (member_id, provider, account_email_hash) DO UPDATE SET
+         account_email_enc = excluded.account_email_enc,
          refresh_token_enc = COALESCE(excluded.refresh_token_enc, calendar_connections.refresh_token_enc),
          access_token_enc = excluded.access_token_enc,
          access_token_expires_at = excluded.access_token_expires_at,
          status = 'active', last_error = NULL, updated_at = excluded.updated_at`,
     )
-    .bind(newId(), memberId, accountEmail.toLowerCase(), tokens.refreshTokenEnc, tokens.accessTokenEnc, tokens.expiresAt, now, now)
+    .bind(newId(), memberId, e.enc, e.hash, tokens.refreshTokenEnc, tokens.accessTokenEnc, tokens.expiresAt, now, now)
     .run();
 }
 

@@ -3,11 +3,24 @@
  * メールは EMAIL_PROVIDER で送り方を切り替える: 'log' は送らずに email_outbox に残すだけ（開発用）、'resend' は Resend API で送る。
  * どちらの場合も email_outbox に記録する（送信ログ画面で確認できる）
  */
+import { insertOutbox } from '../db/bookings';
 import type { Bindings } from '../env';
 import { newId, nowIso } from '../lib/util';
 
 export interface Mail {
-  kind: 'guest_confirmed' | 'host_confirmed' | 'cancelled' | 'rescheduled' | 'reminder' | 'no_slot';
+  kind:
+    | 'guest_confirmed'
+    | 'host_confirmed'
+    | 'cancelled'
+    | 'rescheduled'
+    | 'reminder'
+    | 'no_slot'
+    | 'guest_links' // 応募者への予定確認 URL の再送
+    | 'signup_verify' // 新規登録のメール確認
+    | 'signup_exists' // 登録済みのメールアドレスで新規登録されたときの知らせ
+    | 'signup_request' // 管理者への承認依頼
+    | 'signup_approved' // 承認の知らせ
+    | 'password_reset'; // パスワード再設定のリンク
   to: string;
   subject: string;
   body: string;
@@ -36,12 +49,10 @@ export async function sendMail(env: Bindings, mail: Mail): Promise<void> {
     } catch (err) {
       status = 'failed';
       error = err instanceof Error ? err.message : String(err);
-      console.log(`[mail] ${mail.to} への送信に失敗: ${error}`);
+      console.log(`[mail] ${mail.kind} の送信に失敗: ${error}`);
     }
   }
-  await env.DB.prepare('INSERT INTO email_outbox (id, kind, to_addr, subject, body, booking_id, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(newId(), mail.kind, mail.to, mail.subject, mail.body, mail.bookingId ?? null, status, error, nowIso())
-    .run();
+  await insertOutbox(env.DB, { id: newId(), kind: mail.kind, to: mail.to, subject: mail.subject, body: mail.body, bookingId: mail.bookingId ?? null, status, error, createdAt: nowIso() });
 }
 
 export async function sendMails(env: Bindings, mails: Mail[]): Promise<void> {

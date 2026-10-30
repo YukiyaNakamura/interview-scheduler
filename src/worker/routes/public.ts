@@ -1,16 +1,19 @@
 /** 応募者用の公開 API（ログイン不要。docs/01「API」応募者用） */
 import { Hono } from 'hono';
 import { z } from 'zod';
-import type { BookingCreateResponse, PublicCalendar, SlotsResponse } from '../../shared/api';
+import type { BookingCreateResponse, MessageResponse, PublicCalendar, SlotsResponse } from '../../shared/api';
 import { type CalendarSettings, LOCATION_LABELS } from '../../shared/schema';
 import { windowOf } from '../../shared/slots';
-import { getBookingByToken } from '../db/bookings';
+import { getBookingByToken, listUpcomingBookingsByEmail } from '../db/bookings';
 import { type CalendarRow, getCalendar, getCalendarBySlug, getOneTimeLink, listCandidateSlots, listMembers, parseSettings } from '../db/calendars';
 import { getMembersByIds } from '../db/members';
 import type { AppEnv } from '../env';
-import { noSlotMail } from '../services/messages';
-import { sendMails } from '../integrations/notify';
+import { guestLinksMail, noSlotMail } from '../services/messages';
+import { sendMail, sendMails } from '../integrations/notify';
 import { buildIcs } from '../lib/ics';
+import { LIMITS, reserveAll } from '../lib/limits';
+import { emailIndex } from '../lib/pii';
+import { clientInfo } from '../lib/session';
 import { appUrl, HttpError, manageUrl } from '../lib/util';
 import { cancelBooking, confirmBooking, findSlots, rescheduleBooking, toPublicBooking } from '../services/booking';
 
@@ -188,4 +191,23 @@ publicApi.get('/bookings/:token/ics', async (c) => {
     sequence: b.reschedule_count,
   });
   return new Response(ics, { headers: { 'content-type': 'text/calendar; charset=utf-8', 'content-disposition': 'attachment; filename="invite.ics"' } });
+});
+
+/**
+ * 予約した面接の確認 URL をメールで送り直す（最初の画面の「応募者の方」から。ログインなし）。
+ * 予約の有無は応答から分からないようにし、メールは応答のあとに送る。送り先ごと・IP ごとに1時間3回・5回まで
+ */
+publicApi.post('/booking-links', async (c) => {
+  const { email } = z.object({ email: z.email('メールアドレスが正しくありません').max(254) }).parse(await c.req.json());
+  await reserveAll(c, [LIMITS.linksIp(clientInfo(c).ip), LIMITS.linksEmail(await emailIndex(email))]);
+  const bookings = await listUpcomingBookingsByEmail(c.env.DB, email);
+  if (bookings.length > 0) {
+    const base = appUrl(c.env, c);
+    const mail = guestLinksMail(
+      c.env.APP_NAME,
+      bookings.map((b) => ({ calendarName: b.calendar_name, booking: b, manageUrl: manageUrl(base, b.manage_token) })),
+    );
+    c.executionCtx.waitUntil(sendMail(c.env, { kind: 'guest_links', to: bookings[0]!.guest_email, ...mail }));
+  }
+  return c.json<MessageResponse>({ message: '入力されたメールアドレスで予約中の面接があれば、予定確認の URL をメールで送りました。届かないときは迷惑メールフォルダも確認してください。' });
 });

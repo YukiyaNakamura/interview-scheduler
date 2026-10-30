@@ -1,6 +1,10 @@
-/** booking_calendars / calendar_members / candidate_slots / one_time_links へのアクセス */
+/**
+ * booking_calendars / calendar_members / candidate_slots / one_time_links へのアクセス。
+ * カレンダーの設定（通知先メールアドレス・閲覧パスワード・Webhook URL を含む）は DB では暗号化して持ち、ここで復号する（lib/pii.ts）
+ */
 import type { CalendarDetail } from '../../shared/api';
 import { type CalendarSettings, defaultSettings } from '../../shared/schema';
+import { open, seal } from '../lib/pii';
 import { calendarUrl, newId, newToken, nowIso, parseJson } from '../lib/util';
 
 export interface CalendarRow {
@@ -10,9 +14,17 @@ export interface CalendarRow {
   name: string;
   internal_name: string;
   status: 'open' | 'closed';
+  /** 復号した設定の JSON */
   settings: string;
   created_at: string;
   updated_at: string;
+}
+
+type CalendarDbRow = Omit<CalendarRow, 'settings'> & { settings_enc: string };
+
+async function toCalendarRow(r: CalendarDbRow): Promise<CalendarRow> {
+  const { settings_enc, ...rest } = r;
+  return { ...rest, settings: await open(settings_enc) };
 }
 
 export interface CalendarMemberRow {
@@ -29,16 +41,18 @@ export function parseSettings(text: string): CalendarSettings {
 }
 
 export async function getCalendar(db: D1Database, id: string): Promise<CalendarRow | null> {
-  return db.prepare('SELECT * FROM booking_calendars WHERE id = ?').bind(id).first<CalendarRow>();
+  const row = await db.prepare('SELECT * FROM booking_calendars WHERE id = ?').bind(id).first<CalendarDbRow>();
+  return row ? toCalendarRow(row) : null;
 }
 
 export async function getCalendarBySlug(db: D1Database, slug: string): Promise<CalendarRow | null> {
-  return db.prepare('SELECT * FROM booking_calendars WHERE slug = ?').bind(slug).first<CalendarRow>();
+  const row = await db.prepare('SELECT * FROM booking_calendars WHERE slug = ?').bind(slug).first<CalendarDbRow>();
+  return row ? toCalendarRow(row) : null;
 }
 
 export async function listCalendars(db: D1Database): Promise<CalendarRow[]> {
-  const { results } = await db.prepare('SELECT * FROM booking_calendars ORDER BY created_at DESC').all<CalendarRow>();
-  return results;
+  const { results } = await db.prepare('SELECT * FROM booking_calendars ORDER BY created_at DESC').all<CalendarDbRow>();
+  return Promise.all(results.map(toCalendarRow));
 }
 
 export async function listMembers(db: D1Database, calendarId: string): Promise<CalendarMemberRow[]> {
@@ -99,9 +113,9 @@ export async function insertCalendar(
   await db.batch([
     db
       .prepare(
-        'INSERT INTO booking_calendars (id, kind, slug, name, internal_name, status, settings, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO booking_calendars (id, kind, slug, name, internal_name, status, settings_enc, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .bind(id, kind, data.slug, data.name, data.internalName, data.status, JSON.stringify(data.settings), now, now),
+      .bind(id, kind, data.slug, data.name, data.internalName, data.status, await seal(JSON.stringify(data.settings)), now, now),
     ...memberStatements(db, id, data.members),
     ...candidateStarts.map((s) => db.prepare('INSERT INTO candidate_slots (calendar_id, start_at) VALUES (?, ?)').bind(id, s)),
   ]);
@@ -111,8 +125,8 @@ export async function insertCalendar(
 export async function updateCalendar(db: D1Database, id: string, data: CalendarWrite): Promise<void> {
   await db.batch([
     db
-      .prepare('UPDATE booking_calendars SET slug = ?, name = ?, internal_name = ?, status = ?, settings = ?, updated_at = ? WHERE id = ?')
-      .bind(data.slug, data.name, data.internalName, data.status, JSON.stringify(data.settings), nowIso(), id),
+      .prepare('UPDATE booking_calendars SET slug = ?, name = ?, internal_name = ?, status = ?, settings_enc = ?, updated_at = ? WHERE id = ?')
+      .bind(data.slug, data.name, data.internalName, data.status, await seal(JSON.stringify(data.settings)), nowIso(), id),
     db.prepare('DELETE FROM calendar_members WHERE calendar_id = ?').bind(id),
     ...memberStatements(db, id, data.members),
   ]);
