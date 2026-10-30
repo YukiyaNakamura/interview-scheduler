@@ -151,3 +151,82 @@ export function noSlotMail(appName: string, calendarName: string, input: { name:
     ]),
   };
 }
+
+// ---- 応募者への予定確認 URL の再送 ----
+
+export function guestLinksMail(appName: string, bookings: { calendarName: string; booking: Pick<BookingRow, 'start_at' | 'end_at' | 'guest_timezone' | 'guest_name'>; manageUrl: string }[]) {
+  return {
+    subject: `【${appName}】ご予約中の面接の確認`,
+    body: join([
+      `${bookings[0]?.booking.guest_name ?? ''} 様`,
+      'ご予約中の面接は次のとおりです。それぞれの URL から、予定の確認・キャンセル・日程変更ができます。',
+      ...bookings.map((x) => `■ ${x.calendarName}\n日時: ${when(x.booking, x.booking.guest_timezone)}\n${x.manageUrl}`),
+      'このメールに心当たりがない場合は、破棄してください。',
+      `--\nこのメールは ${appName} から自動送信されています。`,
+    ]),
+  };
+}
+
+// ---- 管理者の新規登録・パスワード再設定 ----
+
+const adminFooter = (appName: string) => `--\nこのメールは ${appName}（面接の日程調整）の管理画面から自動送信されています。`;
+
+export function signupVerifyMail(appName: string, name: string, verifyUrl: string) {
+  return {
+    subject: `【${appName}】メールアドレスの確認`,
+    body: join([
+      `${name} 様`,
+      `${appName} の管理画面への新規登録を受け付けました。次の URL を開き、登録したときのパスワードを入れると、メールアドレスの確認が終わります（24時間有効）。`,
+      verifyUrl,
+      '確認のあと、管理者が承認すると使えるようになります。',
+      '心当たりがない場合は、このメールを無視してください（URL を開かなければ登録は進みません）。',
+      adminFooter(appName),
+    ]),
+  };
+}
+
+export function signupExistsMail(appName: string, loginUrl: string, forgotUrl: string) {
+  return {
+    subject: `【${appName}】新規登録について`,
+    body: join([
+      `このメールアドレスで ${appName} の管理画面への新規登録がありましたが、すでに登録されています。`,
+      `ログイン: ${loginUrl}`,
+      `パスワードを忘れた場合: ${forgotUrl}`,
+      '心当たりがない場合は、このメールを無視してください。',
+      adminFooter(appName),
+    ]),
+  };
+}
+
+export function signupRequestMail(appName: string, applicant: { name: string; email: string }, accountsUrl: string) {
+  return {
+    subject: `【${appName}】新規登録の承認依頼: ${applicant.name}様`,
+    body: join([
+      `${applicant.name}様（${applicant.email}）が管理画面に新規登録し、メールアドレスの確認が済みました。`,
+      '管理画面では応募者の名前・メールアドレスが見られます。社内の人か確かめてから承認してください。',
+      `承認・却下はこちら: ${accountsUrl}`,
+      adminFooter(appName),
+    ]),
+  };
+}
+
+export function signupApprovedMail(appName: string, name: string, loginUrl: string) {
+  return {
+    subject: `【${appName}】管理画面の利用が承認されました`,
+    body: join([`${name} 様`, '管理画面の利用が承認されました。初回のログインでは、スマホの認証アプリで2段階認証を登録します。', `ログイン: ${loginUrl}`, adminFooter(appName)]),
+  };
+}
+
+export function passwordResetMail(appName: string, name: string, resetUrl: string) {
+  return {
+    subject: `【${appName}】パスワードの再設定`,
+    body: join([
+      `${name} 様`,
+      'パスワードを再設定するには、次の URL を開いて新しいパスワードを入れてください（30分有効・1回だけ使えます）。',
+      resetUrl,
+      '再設定しても、ログインには今までどおり2段階認証のコードが必要です。',
+      '心当たりがない場合は、このメールを無視してください（パスワードは変わりません）。',
+      adminFooter(appName),
+    ]),
+  };
+}

@@ -15,11 +15,13 @@ import {
   listBookingHosts,
   listCalendarAssignments,
   listInternalBusy,
+  sealBookingPii,
 } from '../db/bookings';
 import { type ConnectionRow, getMembersByIds, listConnectionsForMembers } from '../db/members';
 import type { Bindings } from '../env';
 import { deleteGoogleEvent, googleBusy, insertGoogleEvent } from '../integrations/google';
 import { type Mail, postSlack, postWebhook, sendMails } from '../integrations/notify';
+import { seal } from '../lib/pii';
 import { HttpError, manageUrl, newId, newToken, nowIso, parseJson } from '../lib/util';
 import { cancelledMail, guestConfirmedMail, hostConfirmedMail, type MessageContext, rescheduledMail } from './messages';
 
@@ -49,7 +51,7 @@ async function externalBusy(env: Bindings, conns: ConnectionRow[], from: Date, t
     try {
       all.push(...(await googleBusy(env, conn, from, to)));
     } catch (err) {
-      console.log(`[busy] ${conn.account_email} の空き確認に失敗: ${err instanceof Error ? err.message : String(err)}`);
+      console.log(`[busy] 連携 ${conn.id} の空き確認に失敗: ${err instanceof Error ? err.message : String(err)}`);
       return [{ start: from.getTime(), end: to.getTime() }];
     }
   }
@@ -349,16 +351,18 @@ function hostRecipients(settings: CalendarSettings, hostEmails: string[]): strin
 /** 担当メンバーの行。メンバーを後で削除しても誰の予定だったか分かるよう、名前とメールを控えておく */
 async function hostInserts(env: Bindings, bookingId: string, hostIds: string[], startAt: string): Promise<D1PreparedStatement[]> {
   const members = await getMembersByIds(env.DB, hostIds);
-  return hostIds.map((id) => {
-    const m = members.find((x) => x.id === id);
-    return env.DB.prepare('INSERT INTO booking_hosts (booking_id, member_id, member_name, member_email, start_at, active) VALUES (?, ?, ?, ?, ?, 1)').bind(
-      bookingId,
-      id,
-      m?.name ?? '',
-      m?.email ?? '',
-      startAt,
-    );
-  });
+  return Promise.all(
+    hostIds.map(async (id) => {
+      const m = members.find((x) => x.id === id);
+      return env.DB.prepare('INSERT INTO booking_hosts (booking_id, member_id, member_name, member_email_enc, start_at, active) VALUES (?, ?, ?, ?, ?, 1)').bind(
+        bookingId,
+        id,
+        m?.name ?? '',
+        await seal(m?.email ?? ''),
+        startAt,
+      );
+    }),
+  );
 }
 
 export async function confirmBooking(env: Bindings, defer: Defer, base: string, cal: CalendarRow, input: BookingCreateInput): Promise<BookingRow> {
@@ -413,14 +417,15 @@ export async function confirmBooking(env: Bindings, defer: Defer, base: string, 
   };
 
   const db = env.DB;
+  const pii = await sealBookingPii(b);
   const statements = [
     db
       .prepare(
-        `INSERT INTO bookings (id, calendar_id, status, start_at, end_at, block_start_at, block_end_at, guest_name, guest_email, guest_company, guest_comment,
-          guest_timezone, answers, url_params, location_type, location_text, meeting_url, manage_token, one_time_token, reschedule_count, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        `INSERT INTO bookings (id, calendar_id, status, start_at, end_at, block_start_at, block_end_at, guest_name, guest_email_enc, guest_email_hash, guest_company, guest_comment,
+          guest_timezone, answers_enc, url_params, location_type, location_text, meeting_url, manage_token, one_time_token, reschedule_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       )
-      .bind(b.id, b.calendar_id, b.status, b.start_at, b.end_at, b.block_start_at, b.block_end_at, b.guest_name, b.guest_email, b.guest_company, b.guest_comment, b.guest_timezone, b.answers, b.url_params, b.location_type, b.location_text, null, b.manage_token, b.one_time_token, now, now),
+      .bind(b.id, b.calendar_id, b.status, b.start_at, b.end_at, b.block_start_at, b.block_end_at, b.guest_name, pii.guestEmailEnc, pii.guestEmailHash, b.guest_company, b.guest_comment, b.guest_timezone, pii.answersEnc, b.url_params, b.location_type, b.location_text, null, b.manage_token, b.one_time_token, now, now),
     ...(await hostInserts(env, b.id, hostIds, b.start_at)),
   ];
   // ワンタイム URL・候補を選ぶ方式は1回きり。「まだ使われていなければ」の条件つきで閉じ、閉じられなかったら（同時に別の人が確定した）取り消す

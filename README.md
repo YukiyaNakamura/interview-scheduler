@@ -1,6 +1,6 @@
 # Aiteru（面接の日程調整）
 
-TimeRex の仕様をもとにした面接の日程調整 Web アプリ。
+TimeRex の仕様をもとにした面接の日程調整 Web アプリ。最初の画面（`/`）で「採用担当の方」か「応募者の方」を選ぶ。
 
 - **管理画面** `/admin`（**ログインが要る**: パスワード＋2段階認証）: 面接官（メンバー）を登録し、日程調整カレンダーを作って URL を応募者に送る。確定した予定の確認・キャンセル・CSV
 - **応募画面** `/c/<URL>`（ログインなし）: 応募者は日時を選び、名前とメールアドレスを入れるだけで面接が確定する
@@ -17,10 +17,11 @@ npm run db:migrate:local   # 手元の D1 にテーブルを作る
 npm run dev                # http://localhost:5180
 ```
 
-http://localhost:5180/admin を開くとログイン画面になる。初回は「最初の管理者を作る」が出るので、`.dev.vars` の `ADMIN_SETUP_TOKEN` を入れて自分のアカウントを作り、
+http://localhost:5180 を開き「採用担当の方」を選ぶとログイン画面になる。初回は「最初の管理者を作る」が出るので、`.dev.vars` の `ADMIN_SETUP_TOKEN` を入れて自分のアカウントを作り、
 スマホの認証アプリ（Google Authenticator など）で QR コードを読み取って6桁のコードを入れる。
 ログインしたら「メンバー」で面接官を登録 →「日程調整カレンダー」で新規作成 → URL を開くと応募画面。
-メールは `EMAIL_PROVIDER=log` なので実際には送らず、管理画面の「送信ログ」で中身を確認できる。
+メールは `EMAIL_PROVIDER=log` なので実際には送らず、管理画面の「送信ログ」で中身を確認できる
+（新規登録の確認メール・パスワード再設定のリンクもここに出る。開発中は送信ログから URL を開いて試す）。
 
 ```sh
 npm test            # 空き枠計算・リマインド時刻・パスワード・2段階認証のテスト
@@ -45,7 +46,7 @@ npm run typecheck
 ```sh
 npx wrangler d1 create interview-scheduler-db   # 出てきた database_id を wrangler.jsonc に書く
 npm run db:migrate:remote
-npx wrangler secret put TOKEN_ENC_KEY          # openssl rand -base64 32
+npx wrangler secret put TOKEN_ENC_KEY          # openssl rand -base64 32（メールアドレスなどの暗号化の鍵。下の「暗号化の鍵」を必ず読む）
 npx wrangler secret put ADMIN_SETUP_TOKEN      # 最初の管理者を作るときの合言葉。openssl rand -base64 24
 npx wrangler secret put GOOGLE_CLIENT_ID
 npx wrangler secret put GOOGLE_CLIENT_SECRET
@@ -54,8 +55,15 @@ npx wrangler secret put APP_URL                # 例: https://interview-schedule
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put EMAIL_FROM             # 例: 採用担当 <noreply@your-domain.jp>
 #   さらに wrangler.jsonc の vars.EMAIL_PROVIDER を "resend" にする
+#   （新規登録の確認・パスワードを忘れた・応募者への予定確認 URL の再送は、メールが送れないと使えない）
 npm run deploy
 ```
+
+### 暗号化の鍵（TOKEN_ENC_KEY）
+
+メールアドレス・応募者の回答・カレンダーの設定・送信ログは、この鍵で暗号化して DB に入れている（docs/01「個人情報の暗号化」）。
+**鍵をなくしたり別の値に変えたりすると、保存したメールアドレスなどが読めなくなる。** `wrangler secret put` で入れた値は後から見られないので、
+作ったときにパスワード管理ソフトなど安全な場所に控えておく。
 
 ### 最初の管理者を作る
 
@@ -66,7 +74,9 @@ npm run deploy
 
 ### ログインの仕組み（詳しくは docs/01「ログイン」）
 
-- 管理画面と管理 API はパスワード＋2段階認証（認証アプリの6桁）が必須。応募画面（`/c/*` `/r/*` `/api/public/*`）はログインなし
+- 管理画面と管理 API はパスワード＋2段階認証（認証アプリの6桁）が必須。応募画面（`/c/*` `/r/*` `/guest` `/api/public/*`）はログインなし
+- 新規登録した人は、メールアドレスの確認と既存の管理者の承認（「アカウント」画面）が済むまで使えない
+- パスワードを忘れたら、ログイン画面の「パスワードを忘れた方」からメールで再設定できる（2段階認証はそのまま必要）
 - パスワードは同じメールアドレスで15分に5回・同じ IP で20回、2段階認証のコードは24時間に10回まで。超えるとロックし、ほかの管理者がリセットすると解ける。ログインの記録は「アカウント」画面で見られる
 - さらに守りたいときは、Cloudflare Zero Trust → Access で `/admin*` `/api/admin/*` `/api/auth/*` `/auth/*` `/login` を社内のメールアドレスに限定できる（任意。アプリのコードは変更不要）
 
@@ -85,4 +95,4 @@ npx wrangler d1 execute interview-scheduler-db --remote --command "DELETE FROM a
 
 Zoom / Microsoft Teams の URL 自動発行、Outlook 予定表連携、質問のファイルアップロード、グループ投票・セミナー・ルーティング、
 候補を選んで日程調整の「仮予定」登録、確定後の参加者変更、応募画面のボット対策（Turnstile）、
-Google / Microsoft アカウントでの管理画面ログイン、パスワードを忘れたときのメールでの自分でのリセット。
+Google / Microsoft アカウントでの管理画面ログイン。

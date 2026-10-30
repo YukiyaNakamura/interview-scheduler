@@ -11,6 +11,7 @@ import type { ApiError, AppConfig } from '../shared/api';
 import type { AppEnv, Bindings } from './env';
 import { googleEnabled } from './integrations/google';
 import { runCleanup, runReminders } from './jobs/reminders';
+import { configurePii } from './lib/pii';
 import { noStore, requireAdmin, sameOriginWrites } from './lib/session';
 import { HttpError } from './lib/util';
 import { accounts } from './routes/accounts';
@@ -21,6 +22,11 @@ import { publicApi } from './routes/public';
 
 const app = new Hono<AppEnv>();
 
+// メールアドレスなどの暗号化の鍵（DB の読み書きで使う。lib/pii.ts）
+app.use('*', async (c, next) => {
+  configurePii(c.env.TOKEN_ENC_KEY);
+  await next();
+});
 // nosniff・HSTS・X-Frame-Options など。応募画面の埋め込み（?embed=1）は画面側（dist/web）の応答なのでここの対象外
 app.use('*', secureHeaders());
 for (const path of ['/api/auth/*', '/api/admin/*']) app.use(path, noStore, sameOriginWrites);
@@ -52,6 +58,7 @@ app.onError((err, c) => {
 export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
+    configurePii(env.TOKEN_ENC_KEY);
     if (controller.cron === '0 18 * * *') ctx.waitUntil(runCleanup(env));
     else ctx.waitUntil(runReminders(env).then((n) => console.log(`[reminders] ${n} 件送信`)));
   },

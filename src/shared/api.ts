@@ -72,11 +72,41 @@ export interface PasswordChangeInput {
   newPassword: string;
 }
 
+/** POST /api/auth/signup（新規登録。メールの確認 → 管理者の承認のあとに使える） */
+export interface SignupInput {
+  name: string;
+  email: string;
+  password: string;
+}
+
+/** POST /api/auth/password-reset/request */
+export interface PasswordResetRequestInput {
+  email: string;
+}
+
+/** POST /api/auth/password-reset/confirm */
+export interface PasswordResetConfirmInput {
+  token: string;
+  newPassword: string;
+}
+
+/** 新規登録・パスワード再設定・予定確認 URL の再送など、結果を文で返すだけの API の応答 */
+export interface MessageResponse {
+  message: string;
+}
+
+/**
+ * 管理者アカウントの状態。
+ * pending_email: 新規登録して、メールアドレスの確認待ち / pending_approval: 確認済みで、管理者の承認待ち / active: 使える
+ */
+export type AccountStatus = 'pending_email' | 'pending_approval' | 'active';
+
 /** GET /api/admin/accounts の1件（管理画面にログインできる人） */
 export interface AccountInfo {
   id: string;
   name: string;
   email: string;
+  status: AccountStatus;
   mfaEnabled: boolean;
   mustChangePassword: boolean;
   lastLoginAt: string | null;
@@ -109,7 +139,12 @@ export type AuthEventKind =
   | 'account_created'
   | 'account_deleted'
   | 'password_reset'
-  | 'mfa_reset';
+  | 'mfa_reset'
+  | 'signup_requested'
+  | 'email_verified'
+  | 'account_approved'
+  | 'password_reset_requested'
+  | 'password_reset_by_email';
 
 /** GET /api/admin/auth-events の1件 */
 export interface AuthEventItem {
@@ -294,6 +329,11 @@ export interface OutboxItem {
 }
 
 // ---- 公開 API（応募者。ログイン不要） ----
+
+/** POST /api/public/booking-links（予約した面接の確認 URL をメールで送り直す） */
+export interface BookingLinksInput {
+  email: string;
+}
 
 /** GET /api/public/c/:slug?ot=<ワンタイムトークン>（パスワードはヘッダー x-calendar-password） */
 export interface PublicCalendar {

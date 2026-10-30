@@ -1,11 +1,13 @@
 -- 初期スキーマ。日時はすべて UTC の ISO 文字列（Date#toISOString() の形）で持つ。文字列の大小比較がそのまま時刻の前後になる
+-- メールアドレスは *_enc（AES-GCM で暗号化）と *_hash（検索用の目印。HMAC）で持ち、平文では持たない（src/worker/lib/pii.ts）
 -- 面接官は members として管理画面で登録する。管理画面のログイン（管理者）は 0002_admin_auth.sql
 
 -- メンバー（面接官）
 CREATE TABLE members (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE,
+  email_enc TEXT NOT NULL,
+  email_hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
 
@@ -22,7 +24,8 @@ CREATE TABLE calendar_connections (
   id TEXT PRIMARY KEY,
   member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
   provider TEXT NOT NULL, -- 'google'
-  account_email TEXT NOT NULL,
+  account_email_enc TEXT NOT NULL,
+  account_email_hash TEXT NOT NULL,
   refresh_token_enc TEXT,
   access_token_enc TEXT,
   access_token_expires_at TEXT,
@@ -32,10 +35,10 @@ CREATE TABLE calendar_connections (
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE (member_id, provider, account_email)
+  UNIQUE (member_id, provider, account_email_hash)
 );
 
--- 日程調整カレンダー。設定項目は settings（JSON: src/shared/schema.ts の CalendarSettings）にまとめて持つ
+-- 日程調整カレンダー。設定項目は settings_enc（JSON: src/shared/schema.ts の CalendarSettings を暗号化したもの）にまとめて持つ
 CREATE TABLE booking_calendars (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'standard', -- 'standard'（通常）| 'candidates'（候補を選んで日程調整）
@@ -43,7 +46,7 @@ CREATE TABLE booking_calendars (
   name TEXT NOT NULL,
   internal_name TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'open', -- 'open' | 'closed'
-  settings TEXT NOT NULL,
+  settings_enc TEXT NOT NULL, -- 暗号化した JSON（通知先メールアドレス・閲覧パスワード・Webhook URL を含むため）
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -85,11 +88,12 @@ CREATE TABLE bookings (
   block_start_at TEXT NOT NULL,
   block_end_at TEXT NOT NULL,
   guest_name TEXT NOT NULL,
-  guest_email TEXT NOT NULL,
+  guest_email_enc TEXT NOT NULL,
+  guest_email_hash TEXT NOT NULL, -- 予定一覧のメールアドレス検索・応募者への予定確認 URL の再送に使う
   guest_company TEXT NOT NULL DEFAULT '',
   guest_comment TEXT NOT NULL DEFAULT '',
   guest_timezone TEXT NOT NULL,
-  answers TEXT NOT NULL DEFAULT '[]', -- JSON: [{ questionId, label, value }]
+  answers_enc TEXT NOT NULL, -- 暗号化した JSON: [{ questionId, label, value }]（メールアドレスの回答を含むため）
   url_params TEXT NOT NULL DEFAULT '{}', -- JSON: 流入元などのクエリ
   location_type TEXT NOT NULL,
   location_text TEXT NOT NULL DEFAULT '',
@@ -107,6 +111,7 @@ CREATE TABLE bookings (
 CREATE INDEX bookings_start ON bookings(start_at);
 CREATE INDEX bookings_calendar_start ON bookings(calendar_id, start_at);
 CREATE INDEX bookings_reminder ON bookings(status, reminder_sent_at, start_at);
+CREATE INDEX bookings_guest_email ON bookings(guest_email_hash, start_at);
 
 -- 予定の担当メンバー。active=1 の間は (member_id, start_at) が重複できない（同じ人の同時刻のダブルブッキングを DB で防ぐ）。
 -- メンバーを削除しても予定の記録は残すため、member_id に外部キーは付けず、名前を控えておく
@@ -114,7 +119,7 @@ CREATE TABLE booking_hosts (
   booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
   member_id TEXT NOT NULL,
   member_name TEXT NOT NULL,
-  member_email TEXT NOT NULL,
+  member_email_enc TEXT NOT NULL,
   start_at TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   -- 連携カレンダーに登録した予定（JSON: { connectionId, calendarId, eventId, bufferEventIds[] }）
@@ -124,13 +129,13 @@ CREATE TABLE booking_hosts (
 CREATE UNIQUE INDEX booking_hosts_no_double ON booking_hosts(member_id, start_at) WHERE active = 1;
 CREATE INDEX booking_hosts_member ON booking_hosts(member_id, active);
 
--- 送信したメールの記録。EMAIL_PROVIDER=log のときは送らずにここへ残すだけ
+-- 送信したメールの記録。EMAIL_PROVIDER=log のときは送らずにここへ残すだけ。宛先・件名・本文は個人情報を含むので暗号化する
 CREATE TABLE email_outbox (
   id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL, -- 'guest_confirmed' | 'host_confirmed' | 'cancelled' | 'rescheduled' | 'reminder' | 'no_slot'
-  to_addr TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  body TEXT NOT NULL,
+  kind TEXT NOT NULL, -- src/worker/integrations/notify.ts の Mail['kind']
+  to_addr_enc TEXT NOT NULL,
+  subject_enc TEXT NOT NULL,
+  body_enc TEXT NOT NULL,
   booking_id TEXT,
   status TEXT NOT NULL, -- 'logged' | 'sent' | 'failed'
   error TEXT,

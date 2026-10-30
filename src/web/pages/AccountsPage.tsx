@@ -4,7 +4,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
-import type { AccountInfo, AccountInput, AuthEventItem, AuthEventKind, AuthState, TempPasswordResponse } from '../../shared/api';
+import type { AccountInfo, AccountInput, AccountStatus, AuthEventItem, AuthEventKind, AuthState, TempPasswordResponse } from '../../shared/api';
 import { apiDelete, apiGet, apiPost } from '../lib/api';
 import { browserTimeZone, formatDateTimeJa } from '../lib/format';
 import { useAuth } from '../lib/hooks';
@@ -24,6 +24,16 @@ const EVENT_LABELS: Record<AuthEventKind, string> = {
   account_deleted: 'アカウント削除',
   password_reset: 'パスワード再発行',
   mfa_reset: '2段階認証のやり直し',
+  signup_requested: '新規登録',
+  email_verified: 'メールアドレスの確認',
+  account_approved: '承認',
+  password_reset_requested: 'パスワード再設定メールの送信',
+  password_reset_by_email: 'パスワード再設定（メールから）',
+};
+
+const STATUS_BADGES: Record<Exclude<AccountStatus, 'active'>, { tone: 'amber' | 'gray'; label: string }> = {
+  pending_approval: { tone: 'amber', label: '承認待ち' },
+  pending_email: { tone: 'gray', label: 'メール確認待ち' },
 };
 
 const WARN_EVENTS: AuthEventKind[] = ['login_failed', 'login_locked', 'mfa_failed'];
@@ -65,6 +75,8 @@ export function AccountsPage() {
   };
   const issue = (title: string, path: string) => run(async () => setIssued({ title, result: await apiPost<TempPasswordResponse>(path) }));
   const remove = (id: string) => run(() => apiDelete(`/api/admin/accounts/${id}`).then(() => undefined));
+  const approve = (id: string) => run(() => apiPost<AccountInfo>(`/api/admin/accounts/${id}/approve`).then(() => undefined));
+  const waiting = (accounts.data ?? []).filter((a) => a.status === 'pending_approval');
 
   const self = auth.data?.step === 'done' ? auth.data.user : null;
 
@@ -127,6 +139,12 @@ export function AccountsPage() {
 
       {issued && <TempPasswordNotice title={issued.title} result={issued.result} onClose={() => setIssued(null)} />}
 
+      {waiting.length > 0 && (
+        <div className="alert alert-warn">
+          新規登録の承認待ちが {waiting.length} 人います。社内の人か確かめてから「承認」してください。心当たりがなければ「削除」で却下します。
+        </div>
+      )}
+
       <section className="card">
         <h2>ログインできる人</h2>
         {accounts.isLoading && <Spinner />}
@@ -142,10 +160,24 @@ export function AccountsPage() {
               <div className="muted small">{a.lastLoginAt ? `最後のログイン: ${formatDateTimeJa(a.lastLoginAt, tz)}（${a.lastLoginIp ?? '-'}）` : 'まだログインしていません'}</div>
             </div>
             <div className="account-badges">
-              {a.mfaEnabled ? <Badge tone="green">2段階認証あり</Badge> : <Badge tone="amber">2段階認証は未登録</Badge>}
-              {a.mustChangePassword && <Badge tone="amber">仮パスワード</Badge>}
+              {a.status !== 'active' ? (
+                <Badge tone={STATUS_BADGES[a.status].tone}>{STATUS_BADGES[a.status].label}</Badge>
+              ) : (
+                <>
+                  {a.mfaEnabled ? <Badge tone="green">2段階認証あり</Badge> : <Badge tone="amber">2段階認証は未登録</Badge>}
+                  {a.mustChangePassword && <Badge tone="amber">仮パスワード</Badge>}
+                </>
+              )}
             </div>
-            {!a.isSelf && (
+            {!a.isSelf && a.status !== 'active' && (
+              <div className="account-actions">
+                {a.status === 'pending_approval' && (
+                  <ConfirmButton label="承認" message={`${a.name}（${a.email}）さんに管理画面の利用を認めますか？`} confirmLabel="承認" onConfirm={approve(a.id)} className="btn btn-sm btn-primary" />
+                )}
+                <ConfirmButton label="削除" danger message={`${a.name} さんの登録を削除（却下）しますか？`} confirmLabel="削除" onConfirm={remove(a.id)} />
+              </div>
+            )}
+            {!a.isSelf && a.status === 'active' && (
               <div className="account-actions">
                 <ConfirmButton
                   label="パスワード再発行"

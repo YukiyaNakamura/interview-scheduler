@@ -1,0 +1,61 @@
+/**
+ * 試行回数・送信回数の上限（総当たり・メールの大量送信の対策。docs/01「ログイン」）。
+ * パスワードやコードを確かめる「前に」1回分を数え（reserveAttempt）、成功したら戻す。同時に大量に送られても上限を超えては試せない。
+ * メールアドレスはキーにも平文で入れず、目印（lib/pii.ts の emailIndex）を使う
+ */
+import type { Context } from 'hono';
+import { type AttemptLimit, releaseAttempt, reserveAttempt } from '../db/auth';
+import type { AppEnv } from '../env';
+import { HttpError } from './util';
+
+const MIN = 60_000;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+
+/**
+ * - パスワードはメールアドレスごと（15分に5回）と IP ごと（15分に20回）
+ * - 2段階認証は管理者ごと（24時間に10回、超えたら24時間ロック）。パスワードとは別に数えるので、
+ *   パスワードを当てずっぽうで試す人がいても、パスワードを通った本人のコード入力は止まらない
+ * - メールを送るもの（新規登録・パスワード再設定・予定確認 URL の再送）は、送り先ごと・IP ごとに1時間の回数を絞る
+ */
+export const LIMITS = {
+  email: (emailHash: string): AttemptLimit => ({ key: `email:${emailHash}`, max: 5, windowMs: 15 * MIN, lockMs: 15 * MIN }),
+  ip: (ip: string): AttemptLimit => ({ key: `ip:${ip}`, max: 20, windowMs: 15 * MIN, lockMs: 15 * MIN }),
+  mfa: (userId: string): AttemptLimit => ({ key: `mfa:${userId}`, max: 10, windowMs: DAY, lockMs: DAY }),
+  passwordChange: (userId: string): AttemptLimit => ({ key: `pw:${userId}`, max: 5, windowMs: 15 * MIN, lockMs: 15 * MIN }),
+  signupIp: (ip: string): AttemptLimit => ({ key: `signup-ip:${ip}`, max: 5, windowMs: HOUR, lockMs: HOUR }),
+  signupEmail: (emailHash: string): AttemptLimit => ({ key: `signup-email:${emailHash}`, max: 3, windowMs: HOUR, lockMs: HOUR }),
+  resetIp: (ip: string): AttemptLimit => ({ key: `reset-ip:${ip}`, max: 5, windowMs: HOUR, lockMs: HOUR }),
+  resetEmail: (emailHash: string): AttemptLimit => ({ key: `reset-email:${emailHash}`, max: 3, windowMs: HOUR, lockMs: HOUR }),
+  linksIp: (ip: string): AttemptLimit => ({ key: `links-ip:${ip}`, max: 5, windowMs: HOUR, lockMs: HOUR }),
+  linksEmail: (emailHash: string): AttemptLimit => ({ key: `links-email:${emailHash}`, max: 3, windowMs: HOUR, lockMs: HOUR }),
+};
+
+function tooManyError(until: string | null): HttpError {
+  const minutes = until ? Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / MIN)) : 15;
+  const wait = minutes >= 120 ? `${Math.ceil(minutes / 60)} 時間` : `${minutes} 分`;
+  return new HttpError(429, `回数が多すぎるため、一時的に止めています。${wait}ほど待ってからお試しください（管理者の方は、ほかの管理者にリセットを頼むこともできます）`);
+}
+
+/**
+ * 確かめる前に、limits のすべてで1回分を予約する。どれかが上限なら、予約した分を戻して 429。
+ * 戻り値の release() は「成功したので数えない」ときに呼ぶ。失敗のときは呼ばない（そのまま1回として残る）。
+ * onLocked は、この呼び出しで新しくロックがかかったときに呼ばれる（記録を残すため）
+ */
+export async function reserveAll(c: Context<AppEnv>, limits: AttemptLimit[], onLocked?: () => Promise<void>): Promise<{ release: () => Promise<void> }> {
+  const reserved: string[] = [];
+  const release = async () => {
+    for (const key of reserved) await releaseAttempt(c.env.DB, key);
+  };
+  for (const limit of limits) {
+    const r = await reserveAttempt(c.env.DB, limit);
+    if (r.allowed) {
+      reserved.push(limit.key);
+      continue;
+    }
+    await release();
+    if (r.justLocked && onLocked) await onLocked();
+    throw tooManyError(r.lockedUntil);
+  }
+  return { release };
+}

@@ -61,8 +61,9 @@ export async function currentSession(c: Context<AppEnv>): Promise<CurrentSession
   return user ? { session, user } : null;
 }
 
-/** 2段階認証まで終わり、仮パスワードも変えた管理者か */
-export const isFullyLoggedIn = (s: CurrentSession | null): s is CurrentSession => s !== null && s.session.stage === 'full' && s.user.must_change_password === 0;
+/** 承認済みで、2段階認証まで終わり、仮パスワードも変えた管理者か */
+export const isFullyLoggedIn = (s: CurrentSession | null): s is CurrentSession =>
+  s !== null && s.user.status === 'active' && s.session.stage === 'full' && s.user.must_change_password === 0;
 
 /** ログイン中の管理者を c.var.admin に入れる。いなければ 401 */
 export const requireAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {

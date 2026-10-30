@@ -5,10 +5,10 @@
  */
 import { addDays, zonedParts, zonedToUtc } from '../../shared/time';
 import { cleanupAuth } from '../db/auth';
-import type { BookingRow } from '../db/bookings';
+import { type BookingDbRow, listBookingHosts, toBookingRow } from '../db/bookings';
 import { parseSettings } from '../db/calendars';
-import { listBookingHosts } from '../db/bookings';
 import type { Bindings } from '../env';
+import { open } from '../lib/pii';
 import { sendMail } from '../integrations/notify';
 import { appUrl, manageUrl } from '../lib/util';
 import { reminderMail } from '../services/messages';
@@ -23,16 +23,17 @@ export function reminderTimes(startAt: string, guestTz: string, hour: number): {
 export async function runReminders(env: Bindings, now = new Date()): Promise<number> {
   // 48時間以内に始まる、まだリマインドしていない確定予定
   const { results } = await env.DB.prepare(
-    `SELECT b.*, c.name AS c_name, c.settings AS c_settings, c.slug AS c_slug, c.kind AS c_kind FROM bookings b JOIN booking_calendars c ON c.id = b.calendar_id
+    `SELECT b.*, c.name AS c_name, c.settings_enc AS c_settings_enc, c.slug AS c_slug, c.kind AS c_kind FROM bookings b JOIN booking_calendars c ON c.id = b.calendar_id
      WHERE b.status = 'confirmed' AND b.reminder_sent_at IS NULL AND b.start_at > ? AND b.start_at < ?`,
   )
     .bind(now.toISOString(), new Date(now.getTime() + 48 * 3_600_000).toISOString())
-    .all<BookingRow & { c_name: string; c_settings: string; c_kind: 'standard' | 'candidates' }>();
+    .all<BookingDbRow & { c_name: string; c_settings_enc: string; c_kind: 'standard' | 'candidates' }>();
 
   let sent = 0;
   const base = appUrl(env);
-  for (const b of results) {
-    const settings = parseSettings(b.c_settings);
+  for (const row of results) {
+    const b = await toBookingRow(row);
+    const settings = parseSettings(await open(b.c_settings_enc));
     if (!settings.reminder.enabled) continue;
     const { sendAt, cutoff } = reminderTimes(b.start_at, b.guest_timezone, settings.reminder.hour);
     if (now < sendAt) continue;
