@@ -5,7 +5,7 @@
  */
 import { addDays, zonedParts, zonedToUtc } from '../../shared/time';
 import { cleanupAuth } from '../db/auth';
-import { type BookingDbRow, listBookingHosts, toBookingRow } from '../db/bookings';
+import { type BookingDbRow, deleteOldOutbox, listBookingHosts, toBookingRow } from '../db/bookings';
 import { parseSettings } from '../db/calendars';
 import type { Bindings } from '../env';
 import { open } from '../lib/pii';
@@ -57,10 +57,14 @@ export async function runReminders(env: Bindings, now = new Date()): Promise<num
   return sent;
 }
 
-/** 期限切れの OAuth state を消す */
+/** 送信ログを残す日数（宛先・件名も個人情報なので長く持たない） */
+const OUTBOX_RETENTION_DAYS = 30;
+
+/** 期限切れの OAuth state・ログインまわりの記録と、古い送信ログを消す */
 export async function runCleanup(env: Bindings): Promise<void> {
   await env.DB.prepare('DELETE FROM oauth_states WHERE created_at < ?').bind(new Date(Date.now() - 3_600_000).toISOString()).run();
   await cleanupAuth(env.DB);
+  await deleteOldOutbox(env.DB, new Date(Date.now() - OUTBOX_RETENTION_DAYS * 86_400_000).toISOString());
 }
 
 

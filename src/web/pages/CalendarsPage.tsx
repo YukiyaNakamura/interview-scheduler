@@ -175,7 +175,11 @@ export function CalendarsPage() {
                     <ConfirmButton
                       label="削除する"
                       danger
-                      message="削除しますか？"
+                      message={
+                        c.upcomingCount > 0
+                          ? `これからの予定が ${c.upcomingCount} 件あるため、このままでは削除できません。先に予定一覧でキャンセルしてください。`
+                          : '削除しますか？応募者の画面は開けなくなります。過去の予定の記録は予定一覧に残ります。'
+                      }
                       confirmLabel="削除"
                       onConfirm={() => run(() => apiDelete(`/api/admin/calendars/${c.id}`), `「${c.name}」を削除しました`)}
                     />

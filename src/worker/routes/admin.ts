@@ -13,7 +13,7 @@ import {
   type CalendarMemberRow,
   type CalendarRow,
   createOneTimeLink,
-  deleteCalendar,
+  archiveCalendar,
   deleteOneTimeLink,
   getCalendar,
   getOneTimeLink,
@@ -83,10 +83,20 @@ admin.patch('/members/:id', async (c) => {
 admin.delete('/members/:id', async (c) => {
   const member = await getMember(c.env.DB, c.req.param('id'));
   if (!member) throw new HttpError(404, 'メンバーが見つかりません');
-  // 参加メンバーがこの人だけのカレンダーがあると、そのカレンダーが使えなくなるので先に知らせる
+  // これからの面接を担当していると、担当者のいない予定が残り、Google カレンダーの予定も消せなくなるので断る
+  const upcoming = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM booking_hosts h JOIN bookings b ON b.id = h.booking_id
+     WHERE h.member_id = ? AND h.active = 1 AND b.status = 'confirmed' AND b.end_at > ?`,
+  )
+    .bind(member.id, new Date().toISOString())
+    .first<number>('n');
+  if (upcoming) {
+    throw new HttpError(409, `これからの面接を ${upcoming} 件担当しているため削除できません。予定一覧で先にキャンセルしてから削除してください（応募者にキャンセルのメールが届きます）`);
+  }
+  // 参加メンバーがこの人だけのカレンダーがあると、そのカレンダーが使えなくなるので先に知らせる（削除済みのカレンダーは除く）
   const { results } = await c.env.DB.prepare(
     `SELECT c.name FROM booking_calendars c JOIN calendar_members m ON m.calendar_id = c.id
-     WHERE m.member_id = ? AND (SELECT COUNT(*) FROM calendar_members x WHERE x.calendar_id = c.id) = 1`,
+     WHERE m.member_id = ? AND c.archived_at IS NULL AND (SELECT COUNT(*) FROM calendar_members x WHERE x.calendar_id = c.id) = 1`,
   )
     .bind(member.id)
     .all<{ name: string }>();
@@ -129,7 +139,7 @@ admin.delete('/connections/:id', async (c) => {
 
 async function calendarOr404(db: D1Database, id: string): Promise<CalendarRow> {
   const cal = await getCalendar(db, id);
-  if (!cal) throw new HttpError(404, '日程調整カレンダーが見つかりません');
+  if (!cal || cal.archived_at) throw new HttpError(404, '日程調整カレンダーが見つかりません');
   return cal;
 }
 
@@ -208,9 +218,17 @@ admin.put('/calendars/:id', async (c) => {
   return c.json(await toCalendarDetail(c.env.DB, (await getCalendar(c.env.DB, cal.id))!, appUrl(c.env, c)));
 });
 
+/** 削除（アーカイブ）。これからの予定があるうちは断る（応募者に何も届かないまま予定が消えるのを防ぐ） */
 admin.delete('/calendars/:id', async (c) => {
   const cal = await calendarOr404(c.env.DB, c.req.param('id'));
-  await deleteCalendar(c.env.DB, cal.id);
+  const upcoming = (await countUpcomingByCalendar(c.env.DB)).get(cal.id) ?? 0;
+  if (upcoming > 0) {
+    throw new HttpError(
+      409,
+      `これからの予定が ${upcoming} 件あるため削除できません。予定一覧で先にキャンセルしてください（応募者にキャンセルのメールが届きます）。新しい予約だけを止めたいときは「受付を停止する」を使ってください`,
+    );
+  }
+  await archiveCalendar(c.env.DB, cal.id);
   return c.json({ ok: true });
 });
 
@@ -337,13 +355,15 @@ function bookingFilter(q: (key: string) => string | undefined): BookingFilter {
     scope: scope === 'past' || scope === 'cancelled' || scope === 'all' ? scope : 'upcoming',
     calendarId: q('calendarId') || undefined,
     q: q('q')?.trim() || undefined,
+    after: q('after') || undefined,
   };
 }
 
+/** 予定一覧（50件ずつ。続きは nextCursor を ?after= に渡す） */
 admin.get('/bookings', async (c) => {
-  const rows = await listBookings(c.env.DB, bookingFilter((k) => c.req.query(k)));
+  const { rows, nextCursor } = await listBookings(c.env.DB, bookingFilter((k) => c.req.query(k)));
   const hosts = await listBookingHosts(c.env.DB, rows.map((r) => r.id));
-  return c.json<BookingListResponse>({ bookings: rows.map((r) => toBookingSummary(r, r.calendar_name, hosts.filter((h) => h.booking_id === r.id))) });
+  return c.json<BookingListResponse>({ bookings: rows.map((r) => toBookingSummary(r, r.calendar_name, hosts.filter((h) => h.booking_id === r.id))), nextCursor });
 });
 
 const csvCell = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
@@ -351,7 +371,7 @@ const csvCell = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"
 /** 予定の CSV（Excel で文字化けしないよう UTF-8 の BOM を付ける）。日時は日本時間 */
 admin.get('/bookings.csv', async (c) => {
   const tz = 'Asia/Tokyo';
-  const rows = await listBookings(c.env.DB, bookingFilter((k) => c.req.query(k)), 10_000);
+  const { rows } = await listBookings(c.env.DB, { ...bookingFilter((k) => c.req.query(k)), after: undefined }, 10_000);
   const hosts = await listBookingHosts(c.env.DB, rows.map((r) => r.id));
   const dt = (iso: string | null) => {
     if (!iso) return '';
@@ -426,6 +446,6 @@ admin.post('/bookings/:id/cancel', async (c) => {
 admin.get('/outbox', async (c) => {
   const rows = await listOutbox(c.env.DB);
   return c.json<OutboxItem[]>(
-    rows.map((r) => ({ id: r.id, kind: r.kind, toAddr: r.to_addr, subject: r.subject, body: r.body, status: r.status, error: r.error, createdAt: r.created_at })),
+    rows.map((r) => ({ id: r.id, kind: r.kind, toAddr: r.to_addr, subject: r.subject, body: r.body, status: r.status, error: r.error, attempts: r.attempts, createdAt: r.created_at })),
   );
 });

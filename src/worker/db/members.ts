@@ -77,8 +77,8 @@ export async function getMember(db: D1Database, id: string): Promise<MemberRow |
 export async function getMembersByIds(db: D1Database, ids: string[]): Promise<MemberRow[]> {
   if (ids.length === 0) return [];
   const { results } = await db
-    .prepare(`SELECT * FROM members WHERE id IN (${ids.map(() => '?').join(',')})`)
-    .bind(...ids)
+    .prepare(`SELECT * FROM members WHERE id IN (SELECT value FROM json_each(?))`)
+    .bind(JSON.stringify(ids))
     .all<MemberDbRow>();
   return Promise.all(results.map(toMemberRow));
 }
@@ -133,8 +133,8 @@ export async function listAllConnections(db: D1Database): Promise<ConnectionRow[
 export async function listConnectionsForMembers(db: D1Database, memberIds: string[]): Promise<ConnectionRow[]> {
   if (memberIds.length === 0) return [];
   const { results } = await db
-    .prepare(`SELECT * FROM calendar_connections WHERE member_id IN (${memberIds.map(() => '?').join(',')}) ORDER BY created_at`)
-    .bind(...memberIds)
+    .prepare(`SELECT * FROM calendar_connections WHERE member_id IN (SELECT value FROM json_each(?)) ORDER BY created_at`)
+    .bind(JSON.stringify(memberIds))
     .all<ConnectionDbRow>();
   return Promise.all(results.map(toConnectionRow));
 }

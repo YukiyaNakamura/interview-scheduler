@@ -1,5 +1,5 @@
-/** 予定一覧（今後・過去・キャンセル）。カレンダーとキーワードで絞り込み、CSV でも出せる */
-import { useQuery } from '@tanstack/react-query';
+/** 予定一覧（今後・過去・キャンセル）。カレンダーとキーワードで絞り込み、CSV でも出せる。50件ずつ「さらに表示」で読む */
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import type { BookingListResponse, CalendarSummary } from '../../shared/api';
@@ -38,11 +38,13 @@ export function BookingsPage() {
   if (q) query.set('q', q);
 
   const calendars = useQuery({ queryKey: ['calendars'], queryFn: () => apiGet<CalendarSummary[]>('/api/admin/calendars') });
-  const list = useQuery({
+  const list = useInfiniteQuery({
     queryKey: ['bookings', query.toString()],
-    queryFn: () => apiGet<BookingListResponse>(`/api/admin/bookings?${query.toString()}`),
+    queryFn: ({ pageParam }) => apiGet<BookingListResponse>(`/api/admin/bookings?${query.toString()}${pageParam ? `&after=${encodeURIComponent(pageParam)}` : ''}`),
+    initialPageParam: '',
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
   });
-  const bookings = list.data?.bookings ?? [];
+  const bookings = list.data?.pages.flatMap((p) => p.bookings) ?? [];
 
   return (
     <div className="page">
@@ -135,6 +137,13 @@ export function BookingsPage() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+      {list.hasNextPage && (
+        <div className="row-gap">
+          <button type="button" className="btn" disabled={list.isFetchingNextPage} onClick={() => list.fetchNextPage()}>
+            {list.isFetchingNextPage ? '読み込み中…' : 'さらに表示'}
+          </button>
         </div>
       )}
     </div>

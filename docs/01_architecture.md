@@ -5,7 +5,8 @@
 - D1（SQLite）。スキーマは `migrations/`、日時はすべて UTC ISO 文字列
 - 画面: React 19 + Vite + React Router + TanStack Query、プレーン CSS（`src/web/styles/`）
 - 検証: Zod（`src/shared/schema.ts` を Worker と画面で共有）
-- テスト: Vitest（`test/`。空き枠計算・パスワード・2段階認証のコードなどの純粋関数）
+- テスト: Vitest（`test/`。空き枠計算・パスワード・2段階認証のコード・回数制限のキーなどの純粋関数）
+- ログ: Workers Logs（`wrangler.jsonc` の `observability`）。ログに個人情報・トークン・Webhook の URL は出さない（予定確認トークンは伏せ、URL はホスト名だけ）
 
 ## ディレクトリ
 ```
@@ -21,6 +22,7 @@ src/worker/      Worker
   lib/           セッション（session.ts）・回数の上限（limits.ts）・パスワード（password.ts）・2段階認証（totp.ts）・個人情報の暗号化（pii.ts）・ID・ICS など
 src/web/         画面（最初の画面 /・応募者の案内 /guest・管理画面 /admin・ログイン /login と応募画面 /c, /r）
 public/_headers  画面の応答ヘッダー（管理画面・ログインの埋め込み禁止と CSP、Referrer-Policy）
+scripts/check-deploy.mjs  本番に出す前の設定の確認（npm run deploy の途中で動く）
 ```
 
 ## ログイン
@@ -65,13 +67,39 @@ DB（D1）にはメールアドレスを平文で入れない（`src/worker/lib/
 | メールアドレス（管理者・面接官・応募者・Google アカウント・ログインの記録） | `*_enc`（AES-GCM で暗号化。同じ値でも毎回違う暗号文）＋ `*_hash`（検索用の目印。小文字にしたメールの HMAC-SHA256。値から元のメールは分からない） |
 | 応募者の回答（メールアドレスの回答を含む） | `answers_enc`（JSON ごと暗号化） |
 | カレンダーの設定（通知先メールアドレス・閲覧パスワード・Webhook URL を含む） | `settings_enc`（JSON ごと暗号化） |
-| 送信ログの宛先・件名・本文 | `to_addr_enc` `subject_enc` `body_enc` |
+| 送信ログの宛先・件名・本文・返信先 | `to_addr_enc` `subject_enc` `body_enc` `reply_to_enc`。本文と返信先は送り直しのためだけに持ち、送り終えたら消す（EMAIL_PROVIDER=log のときだけ残す） |
 | 2段階認証の秘密鍵・Google のトークン | AES-GCM で暗号化（前から） |
 | 名前・会社名 | 平文（予定一覧の部分一致検索に使うため） |
 
 - 鍵は `TOKEN_ENC_KEY`（暗号化用）と、そこから HKDF で作った目印用の鍵。**この鍵をなくす・変えると、保存したメールアドレスなどは読めなくなる**
 - 暗号化・復号は `src/worker/db/*` の読み書きでだけ行い、ほかのコードは復号済みの値を扱う。鍵は Worker の入口で `configurePii(env.TOKEN_ENC_KEY)` して覚える
 - 予定一覧の検索: 名前・会社名は部分一致、メールアドレスは完全一致（大文字・小文字は問わない）
+
+## 予約の確定とメール
+**同時に確定されたときの守り**（`src/worker/services/booking.ts`）:
+- 確定の直前に空き枠を計算し直す（アプリの確認）。そのうえで DB でも止める: 同じ面接官・同じ開始時刻は一意制約、時間が重なる予定（前後の確保時間を含む `block_*` どうし）はトリガー `booking_hosts_no_overlap`（`migrations/0003`）。どちらで止まっても 409「直前に埋まりました」
+- 日・週・月の上限は、確定したあとに数え直す。上限を超えていたら、後から入った方（`rowid` が大きい方）を取り消して 409
+- DB に入った後（Google への登録など）で失敗しても 500 にしない（応募者が失敗したと思って予約し直し、二重になるのを防ぐ）。ログに残して続ける
+
+**メールの送信待ちと送り直し**（`src/worker/integrations/notify.ts`）:
+- `EMAIL_PROVIDER=resend` では、送信ログ `email_outbox` が送信待ちを兼ねる。送る前に `pending` で入れ（予約の確定・キャンセル・日程変更はレスポンスを返す前に入れる）、送れたら `sent`
+- 送れなかったら、10分ごとの定時実行が5分・15分・1時間・3時間の間隔で送り直し、5回目でも送れなければ `failed`。同じメールを2通送らないよう、Resend には送信ログの id を `Idempotency-Key` で渡す
+- 送り終えた（`sent` / `failed`）行は本文と返信先を消す。送信ログの画面にも本文は出さない（パスワード再設定のリンクなどを、ほかの管理者に見られないように）。送信ログは30日で消す
+- `EMAIL_PROVIDER=log`（開発用）は送らずに `logged` で本文ごと残し、送信ログの画面で中身を見られる
+
+**応募画面（ログインなし）の回数の上限**（`src/worker/lib/limits.ts`。IPv6 は /64 でまとめて数える）:
+| 何を | 上限 |
+|---|---|
+| 予約の確定 | IP ごとに1時間30回 |
+| 「都合の合う日がない」の連絡（面接官全員にメールが届く。カレンダーの設定で既定はオフ） | IP ごとに1時間3回・カレンダーごとに1時間20回 |
+| 閲覧パスワード | IP×カレンダーで15分に20回まで試せる（正しければ数えない）。比べるときはハッシュにしてから一定時間で比べる |
+| 予定確認 URL の再送 | 送り先ごとに1時間3回・IP ごとに5回 |
+
+**そのほか**:
+- D1 は1つのクエリに渡せる値が100個までなので、ID の一覧は JSON 1つにして `json_each` で展開する（`IN (SELECT value FROM json_each(?))`）
+- 予定一覧は50件ずつ（開始日時と id を目印にしたページ送り）。CSV は1万件まで
+- カレンダーの削除はアーカイブ（`archived_at`）。これからの予定がある間は断る。アーカイブしたカレンダーは一覧と応募画面に出ず、予定の記録は残る。URL（スラッグ）は空けるので、同じ URL で作り直せる
+- メンバーの削除も、これからの面接を担当している間は断る（担当者のいない予定と、消せない Google の予定が残らないように）
 
 ## そのほか
 - 面接官の Google カレンダー連携（`/auth/google/*`）は管理画面へのログインとは別。ログイン中の管理者が、面接官ごとにカレンダーの読み書きの許可をもらう
@@ -102,23 +130,23 @@ DB（D1）にはメールアドレスを平文で入れない（`src/worker/lib/
 |---|---|---|
 | GET | /api/config | アプリ設定 AppConfig |
 | GET/POST | /api/admin/members | メンバー一覧 MemberInfo[] / 追加 MemberInput |
-| PATCH/DELETE | /api/admin/members/:id | 名前・メールの変更 / 削除（担当中の予定が残っていても削除できる。参加メンバーからは外れる） |
+| PATCH/DELETE | /api/admin/members/:id | 名前・メールの変更 / 削除（これからの面接を担当している間は 409。過去の予定には名前が残り、参加メンバーからは外れる） |
 | GET | /api/admin/connections/:id/calendars | Google のカレンダー一覧 GoogleCalendarItem[] |
 | PATCH | /api/admin/connections/:id | `{checkCalendarIds, writeCalendarId}` → ConnectionInfo |
 | DELETE | /api/admin/connections/:id | 連携解除 |
 | GET | /api/admin/calendars | CalendarSummary[] |
 | POST | /api/admin/calendars | `{name}` → CalendarDetail（初期値で作成） |
-| GET/PUT/DELETE | /api/admin/calendars/:id | CalendarDetail / CalendarUpdateInput |
+| GET/PUT/DELETE | /api/admin/calendars/:id | CalendarDetail / CalendarUpdateInput / 削除（アーカイブ。これからの予定がある間は 409） |
 | POST | /api/admin/calendars/:id/duplicate | 複製 → CalendarDetail |
 | GET/POST | /api/admin/calendars/:id/one-time-links | ワンタイム URL 一覧 OneTimeLinkInfo[] / 発行 |
 | DELETE | /api/admin/one-time-links/:token | ワンタイム URL 削除 |
 | POST | /api/admin/availability | 候補を選ぶ画面の空き状況 |
 | POST | /api/admin/candidate-calendars | 候補を選んで日程調整を作成 → CalendarDetail |
-| GET | /api/admin/bookings | BookingListResponse（`scope=upcoming\|past\|cancelled`, `calendarId`, `q`。`q` は名前・会社名の部分一致かメールアドレスの完全一致） |
+| GET | /api/admin/bookings | BookingListResponse（`scope=upcoming\|past\|cancelled`, `calendarId`, `q`, `after`。`q` は名前・会社名の部分一致かメールアドレスの完全一致。50件ずつで、続きは `nextCursor` を `after` に渡す） |
 | GET | /api/admin/bookings.csv | CSV（同じ絞り込み） |
 | GET | /api/admin/bookings/:id | BookingDetail |
 | POST | /api/admin/bookings/:id/cancel | 管理者がキャンセル `{reason}` |
-| GET | /api/admin/outbox | 送信ログ OutboxItem[]（最新 200 件） |
+| GET | /api/admin/outbox | 送信ログ OutboxItem[]（最新 200 件。本文は EMAIL_PROVIDER=log の記録だけ） |
 | GET/POST | /api/admin/accounts | 管理者の一覧 AccountInfo[] / 追加 AccountInput → TempPasswordResponse |
 | POST | /api/admin/accounts/:id/approve | 新規登録した人を承認（承認待ちの人だけ）→ AccountInfo |
 | POST | /api/admin/accounts/:id/reset-password | 仮パスワードを発行（その人のセッションを切る。自分・承認前の人は不可）→ TempPasswordResponse |
@@ -140,7 +168,7 @@ Google 連携（管理画面にログイン中の管理者だけ。未ログイ�
 | GET | /api/public/c/:slug | PublicCalendar（`?ot=` ワンタイム、ヘッダー `x-calendar-password`） |
 | GET | /api/public/c/:slug/slots | SlotsResponse（`from` `to` は ISO、`ot`、`reschedule=<manageToken>`。reschedule があればパスワード不要） |
 | POST | /api/public/c/:slug/bookings | BookingCreateInput → BookingCreateResponse |
-| POST | /api/public/c/:slug/no-slot | NoSlotInput（都合の良い日程がない） |
+| POST | /api/public/c/:slug/no-slot | NoSlotInput（都合の良い日程がない。回数の上限は「予約の確定とメール」） |
 | GET | /api/public/bookings/:token | PublicBooking |
 | POST | /api/public/bookings/:token/cancel | `{reason}` |
 | POST | /api/public/bookings/:token/reschedule | `{start}` → PublicBooking |
@@ -176,5 +204,6 @@ Google 連携（管理画面にログイン中の管理者だけ。未ログイ�
 | /r/:token | 予定の確認・キャンセル・日程変更 |
 
 ## 定時実行
-- `*/10 * * * *` リマインドメール（jobs/reminders.ts）
-- `0 18 * * *` 期限切れの OAuth state・セッション・メールのリンク、古い試行回数、7日たってもメール確認されない新規登録、180日より前のログインの記録の削除
+- `*/10 * * * *` リマインドメール（jobs/reminders.ts）と、送れなかったメールの送り直し（integrations/notify.ts の retryMails）
+- `0 18 * * *` 期限切れの OAuth state・セッション・メールのリンク、古い試行回数、7日たってもメール確認されない新規登録、180日より前のログインの記録、30日より前の送信ログの削除
+- どちらも失敗したら `console.error` で Workers Logs に残す

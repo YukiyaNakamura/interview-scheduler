@@ -13,18 +13,22 @@ TimeRex の仕様をもとにした面接の日程調整 Web アプリ。最初�
 
 ```sh
 npm install
+cp .dev.vars.example .dev.vars   # 手元用の設定。TOKEN_ENC_KEY と ADMIN_SETUP_TOKEN を埋める（下の注意）
 npm run db:migrate:local   # 手元の D1 にテーブルを作る
 npm run dev                # http://localhost:5180
 ```
 
+`TOKEN_ENC_KEY` には、`openssl rand -base64 32` を実行して**表示された文字列**（`q3Zk…8w=` のような44文字ほど）を貼る。コマンドそのものを貼るのではない。
+`ADMIN_SETUP_TOKEN` も同じように `openssl rand -base64 24` の出力を貼る。
+
 http://localhost:5180 を開き「採用担当の方」を選ぶとログイン画面になる。初回は「最初の管理者を作る」が出るので、`.dev.vars` の `ADMIN_SETUP_TOKEN` を入れて自分のアカウントを作り、
 スマホの認証アプリ（Google Authenticator など）で QR コードを読み取って6桁のコードを入れる。
 ログインしたら「メンバー」で面接官を登録 →「日程調整カレンダー」で新規作成 → URL を開くと応募画面。
-メールは `EMAIL_PROVIDER=log` なので実際には送らず、管理画面の「送信ログ」で中身を確認できる
+手元では `.dev.vars` の `EMAIL_PROVIDER=log` でメールを実際には送らず、管理画面の「送信ログ」で中身を確認できる
 （新規登録の確認メール・パスワード再設定のリンクもここに出る。開発中は送信ログから URL を開いて試す）。
 
 ```sh
-npm test            # 空き枠計算・リマインド時刻・パスワード・2段階認証のテスト
+npm test            # 空き枠計算・リマインド時刻・パスワード・2段階認証・暗号化・回数制限のテスト
 npm run typecheck
 ```
 
@@ -43,21 +47,27 @@ npm run typecheck
 
 ## 本番に出す
 
+`wrangler secret put` は値を聞いてくるので、そこに貼る。`openssl rand …` と書いたものは、そのコマンドを実行して表示された文字列を貼る（コマンドそのものではない）。
+
 ```sh
 npx wrangler d1 create interview-scheduler-db   # 出てきた database_id を wrangler.jsonc に書く
-npm run db:migrate:remote
-npx wrangler secret put TOKEN_ENC_KEY          # openssl rand -base64 32（メールアドレスなどの暗号化の鍵。下の「暗号化の鍵」を必ず読む）
-npx wrangler secret put ADMIN_SETUP_TOKEN      # 最初の管理者を作るときの合言葉。openssl rand -base64 24
-npx wrangler secret put GOOGLE_CLIENT_ID
+npx wrangler secret put TOKEN_ENC_KEY          # openssl rand -base64 32 の出力（メールアドレスなどの暗号化の鍵。下の「暗号化の鍵」を必ず読む）
+npx wrangler secret put ADMIN_SETUP_TOKEN      # 最初の管理者を作るときの合言葉。openssl rand -base64 24 の出力
+npx wrangler secret put APP_URL                # 例: https://interview-scheduler.<サブドメイン>.workers.dev（メールのリンクとリマインドに使う）
+npx wrangler secret put RESEND_API_KEY         # メール送信（Resend）の API キー
+npx wrangler secret put EMAIL_FROM             # 例: 採用担当 <noreply@your-domain.jp>（Resend で認証したドメイン）
+npx wrangler secret put GOOGLE_CLIENT_ID       # Google カレンダー連携を使うなら
 npx wrangler secret put GOOGLE_CLIENT_SECRET
-npx wrangler secret put APP_URL                # 例: https://interview-scheduler.<サブドメイン>.workers.dev
-# メールを実際に送るなら（Resend）
-npx wrangler secret put RESEND_API_KEY
-npx wrangler secret put EMAIL_FROM             # 例: 採用担当 <noreply@your-domain.jp>
-#   さらに wrangler.jsonc の vars.EMAIL_PROVIDER を "resend" にする
-#   （新規登録の確認・パスワードを忘れた・応募者への予定確認 URL の再送は、メールが送れないと使えない）
 npm run deploy
 ```
+
+`npm run deploy` は、型チェック → テスト → 設定の確認（`scripts/check-deploy.mjs`）→ 本番 DB のマイグレーション → ビルド → デプロイ の順に動く。
+設定の確認では、`database_id` が仮の値のまま・`vars.EMAIL_PROVIDER` が `"resend"` でない・必須の秘密情報（`TOKEN_ENC_KEY` `APP_URL` `RESEND_API_KEY` `EMAIL_FROM`）が無い、のどれかがあると止まる
+（メールが送れないと、確定・リマインドのメールが届かず、新規登録の確認・パスワードを忘れた・予定確認 URL の再送も使えないため）。
+`wrangler.jsonc` の `vars` は本番の値で、手元では `.dev.vars` の値（`EMAIL_PROVIDER=log` など）が優先される。
+
+本番のログ（`console.log` / `console.error`）は Cloudflare ダッシュボードの Workers Logs で見られる（`wrangler.jsonc` の `observability`）。
+送れなかったメールは「送信ログ」に「送信待ち」「失敗」として出る。
 
 ### 暗号化の鍵（TOKEN_ENC_KEY）
 
@@ -87,7 +97,10 @@ npm run deploy
 （予定やカレンダーは消えない）:
 
 ```sh
-npx wrangler d1 execute interview-scheduler-db --remote --command "DELETE FROM admin_users WHERE email = '<メールアドレス>'"
+# 1. 消す人の id を調べる（メールアドレスは暗号化しているので、名前で見分ける）
+npx wrangler d1 execute interview-scheduler-db --remote --command "SELECT id, name, status, created_at FROM admin_users"
+# 2. その id の人を消す
+npx wrangler d1 execute interview-scheduler-db --remote --command "DELETE FROM admin_users WHERE id = '<1で調べた id>'"
 # そのあと /login を開くと「最初の管理者を作る」が出る（ADMIN_SETUP_TOKEN が要る。消していたら wrangler secret put で入れ直す）
 ```
 

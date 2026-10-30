@@ -1,7 +1,8 @@
 /**
  * 予約の確定・キャンセル・リスケジュール。DB・Google カレンダー・メール・Webhook をここでまとめて扱う。
  * 流れ（確定）: 空き枠を計算し直して選ばれた枠が空いているか確かめる → 担当者を決める → DB に保存
- *            → 連携カレンダーに予定を登録（Meet 発行）→ メール・Webhook（レスポンスを返した後に送る）
+ *            → 連携カレンダーに予定を登録（Meet 発行）→ メールを送信待ちに入れる → メール・Webhook（レスポンスを返した後に送る）
+ * 同時に確定されたときの守り: 同じ面接官の重なる予定は DB のトリガーが止め（migrations/0003）、上限は確定後に数え直す
  */
 import type { Answer, BookingCreateInput, PublicBooking } from '../../shared/api';
 import { type CalendarSettings, LOCATION_LABELS, type Question } from '../../shared/schema';
@@ -15,12 +16,13 @@ import {
   listBookingHosts,
   listCalendarAssignments,
   listInternalBusy,
+  listMemberAssignments,
   sealBookingPii,
 } from '../db/bookings';
 import { type ConnectionRow, getMembersByIds, listConnectionsForMembers } from '../db/members';
 import type { Bindings } from '../env';
 import { deleteGoogleEvent, googleBusy, insertGoogleEvent } from '../integrations/google';
-import { type Mail, postSlack, postWebhook, sendMails } from '../integrations/notify';
+import { deliverMails, type Mail, postSlack, postWebhook, queueMails } from '../integrations/notify';
 import { seal } from '../lib/pii';
 import { HttpError, manageUrl, newId, newToken, nowIso, parseJson } from '../lib/util';
 import { cancelledMail, guestConfirmedMail, hostConfirmedMail, type MessageContext, rescheduledMail } from './messages';
@@ -365,6 +367,31 @@ async function hostInserts(env: Bindings, bookingId: string, hostIds: string[], 
   );
 }
 
+/** 同じ枠（同じ面接官・同じ開始時刻）の一意制約か、重なる予定を止めるトリガー（migrations/0003）で止まったか */
+function isTakenError(err: unknown): boolean {
+  return err instanceof Error && /UNIQUE|overlap/i.test(err.message);
+}
+
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+/**
+ * 1日などの上限を超えていないか、確定したあとに数え直す。空き枠の計算でも確かめているが、同時に確定されると両方通ることがあるため。
+ * 確定した順に並べ、この予定が上限より後ろなら true（先に入った方が残る）
+ */
+async function overLimitAfterCommit(env: Bindings, cal: CalendarRow, settings: CalendarSettings, b: BookingRow, hostIds: string[], members: MemberInput[]): Promise<boolean> {
+  const limit = settings.limit;
+  if (!limit) return false;
+  const keyOf = (iso: string) => periodKey(zonedParts(new Date(iso), settings.timezone).date, limit.period);
+  const key = keyOf(b.start_at);
+  for (const id of hostIds) {
+    const max = members.find((m) => m.userId === id)?.limit ?? null;
+    if (max === null) continue;
+    const same = (await listMemberAssignments(env.DB, cal.id, id)).filter((a) => keyOf(a.start_at) === key);
+    if (same.findIndex((a) => a.booking_id === b.id) >= max) return true;
+  }
+  return false;
+}
+
 export async function confirmBooking(env: Bindings, defer: Defer, base: string, cal: CalendarRow, input: BookingCreateInput): Promise<BookingRow> {
   const settings = parseSettings(cal.settings);
   if (cal.status !== 'open') throw new HttpError(410, cal.kind === 'candidates' ? 'この日程調整はすでに完了しています' : '現在、日程調整を受け付けていません');
@@ -442,27 +469,43 @@ export async function confirmBooking(env: Bindings, defer: Defer, base: string, 
   try {
     results = await db.batch(statements);
   } catch (err) {
-    if (err instanceof Error && /UNIQUE/i.test(err.message)) throw new HttpError(409, 'この日時は直前に埋まりました。別の日時を選んでください');
+    if (isTakenError(err)) throw new HttpError(409, 'この日時は直前に埋まりました。別の日時を選んでください');
     throw err;
   }
   if (guards.some((i) => (results[i]?.meta.changes ?? 0) === 0)) {
     await db.prepare('DELETE FROM bookings WHERE id = ?').bind(b.id).run();
     throw new HttpError(410, 'この URL はすでに使用済みです');
   }
+  if (await overLimitAfterCommit(env, cal, settings, b, hostIds, members)) {
+    // 取り消す。ワンタイム URL・候補を選ぶ方式も、この予約で閉じた分は開け直す
+    await db.batch([
+      db.prepare('DELETE FROM bookings WHERE id = ?').bind(b.id),
+      ...(input.oneTimeToken ? [db.prepare('UPDATE one_time_links SET used_at = NULL WHERE token = ? AND used_at = ?').bind(input.oneTimeToken, now)] : []),
+      ...(cal.kind === 'candidates' ? [db.prepare("UPDATE booking_calendars SET status = 'open', updated_at = ? WHERE id = ? AND status = 'closed' AND updated_at = ?").bind(nowIso(), cal.id, now)] : []),
+    ]);
+    throw new HttpError(409, 'この日時は直前に埋まりました。別の日時を選んでください');
+  }
 
-  // 連携カレンダーに登録して Meet の URL を受け取る（完了画面に出すため、ここは待つ）
-  const { meetingUrl, external } = await registerEvents(env, cal, settings, b, hostIds);
-  b.meeting_url = meetingUrl;
-  b.location_text = locationTextOf(settings, meetingUrl);
-  await saveExternal(env, b.id, meetingUrl, b.location_text, external);
+  // ここから先で失敗しても予約は確定している。500 を返すと応募者が失敗したと思って予約し直し、二重になるので、記録だけ残して続ける
+  try {
+    // 連携カレンダーに登録して Meet の URL を受け取る（完了画面に出すため、ここは待つ）
+    const { meetingUrl, external } = await registerEvents(env, cal, settings, b, hostIds);
+    b.meeting_url = meetingUrl;
+    b.location_text = locationTextOf(settings, meetingUrl);
+    await saveExternal(env, b.id, meetingUrl, b.location_text, external);
+  } catch (err) {
+    console.log(`[booking] ${b.id} の連携カレンダーへの登録に失敗: ${errorText(err)}`);
+  }
 
+  // メールはレスポンスを返す前に送信待ちに入れる（送る前に処理が止まっても、定時実行が送り直す）
+  const { ctx, hostEmails } = await messageContext(env, base, cal, b);
+  const mails: Mail[] = [];
+  if (settings.sendGuestConfirmation) mails.push({ kind: 'guest_confirmed', to: b.guest_email, bookingId: b.id, ...guestConfirmedMail(ctx) });
+  for (const to of hostRecipients(settings, hostEmails)) mails.push({ kind: 'host_confirmed', to, bookingId: b.id, replyTo: b.guest_email, ...hostConfirmedMail(ctx) });
+  const queued = await queueMails(env, mails);
   defer(
     (async () => {
-      const { ctx, hostEmails } = await messageContext(env, base, cal, b);
-      const mails: Mail[] = [];
-      if (settings.sendGuestConfirmation) mails.push({ kind: 'guest_confirmed', to: b.guest_email, bookingId: b.id, ...guestConfirmedMail(ctx) });
-      for (const to of hostRecipients(settings, hostEmails)) mails.push({ kind: 'host_confirmed', to, bookingId: b.id, replyTo: b.guest_email, ...hostConfirmedMail(ctx) });
-      await sendMails(env, mails);
+      await deliverMails(env, queued);
       await postWebhook(settings.webhookUrl, webhookPayload('booking.confirmed', cal, ctx));
       await postSlack(settings.slackWebhookUrl, `:calendar: 日程確定: ${b.guest_name}様（${cal.name}）\n${hostConfirmedMail(ctx).subject}`);
     })(),
@@ -490,14 +533,15 @@ export async function cancelBooking(env: Bindings, defer: Defer, base: string, c
   ]);
   const updated = (await getBooking(env.DB, b.id))!;
   const hosts = await listBookingHosts(env.DB, [b.id]);
+  const settings = parseSettings(cal.settings);
+  const { ctx, hostEmails } = await messageContext(env, base, cal, updated);
+  const mails: Mail[] = [{ kind: 'cancelled', to: updated.guest_email, bookingId: b.id, ...cancelledMail(ctx, true) }];
+  for (const to of hostRecipients(settings, hostEmails)) mails.push({ kind: 'cancelled', to, bookingId: b.id, ...cancelledMail(ctx, false) });
+  const queued = await queueMails(env, mails);
   defer(
     (async () => {
       await removeEvents(env, hosts);
-      const settings = parseSettings(cal.settings);
-      const { ctx, hostEmails } = await messageContext(env, base, cal, updated);
-      const mails: Mail[] = [{ kind: 'cancelled', to: updated.guest_email, bookingId: b.id, ...cancelledMail(ctx, true) }];
-      for (const to of hostRecipients(settings, hostEmails)) mails.push({ kind: 'cancelled', to, bookingId: b.id, ...cancelledMail(ctx, false) });
-      await sendMails(env, mails);
+      await deliverMails(env, queued);
       await postWebhook(settings.webhookUrl, webhookPayload('booking.cancelled', cal, ctx));
       await postSlack(settings.slackWebhookUrl, `:x: キャンセル: ${updated.guest_name}様（${cal.name}）\n${cancelledMail(ctx, false).subject}`);
     })(),
@@ -524,35 +568,41 @@ export async function rescheduleBooking(env: Bindings, defer: Defer, base: strin
   const blockStart = new Date(start.getTime() - settings.bufferBeforeMin * 60_000).toISOString();
   const blockEnd = new Date(end.getTime() + settings.bufferAfterMin * 60_000).toISOString();
   try {
+    // 先に予定の日時を変えてから担当者を入れ直す（重なりを止めるトリガーが新しい日時で比べるように）
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM booking_hosts WHERE booking_id = ?').bind(b.id),
-      ...(await hostInserts(env, b.id, hostIds, slot.start)),
       env.DB.prepare(
         `UPDATE bookings SET start_at = ?, end_at = ?, block_start_at = ?, block_end_at = ?, reschedule_count = reschedule_count + 1,
            reminder_sent_at = NULL, meeting_url = NULL, location_text = ?, updated_at = ? WHERE id = ?`,
       ).bind(slot.start, slot.end, blockStart, blockEnd, locationTextOf(settings, null), now, b.id),
+      env.DB.prepare('DELETE FROM booking_hosts WHERE booking_id = ?').bind(b.id),
+      ...(await hostInserts(env, b.id, hostIds, slot.start)),
     ]);
   } catch (err) {
-    if (err instanceof Error && /UNIQUE/i.test(err.message)) throw new HttpError(409, 'この日時は直前に埋まりました。別の日時を選んでください');
+    if (isTakenError(err)) throw new HttpError(409, 'この日時は直前に埋まりました。別の日時を選んでください');
     throw err;
   }
 
-  // 古い予定を消して、新しい日時で登録し直す（Meet の URL も新しくなる）
-  await removeEvents(env, oldHosts);
+  // 古い予定を消して、新しい日時で登録し直す（Meet の URL も新しくなる）。失敗しても日程変更は済んでいるので続ける
   const updated = (await getBooking(env.DB, b.id))!;
-  const { meetingUrl, external } = await registerEvents(env, cal, settings, updated, hostIds);
-  updated.meeting_url = meetingUrl;
-  updated.location_text = locationTextOf(settings, meetingUrl);
-  await saveExternal(env, b.id, meetingUrl, updated.location_text, external);
+  try {
+    await removeEvents(env, oldHosts);
+    const { meetingUrl, external } = await registerEvents(env, cal, settings, updated, hostIds);
+    updated.meeting_url = meetingUrl;
+    updated.location_text = locationTextOf(settings, meetingUrl);
+    await saveExternal(env, b.id, meetingUrl, updated.location_text, external);
+  } catch (err) {
+    console.log(`[booking] ${b.id} の連携カレンダーの登録し直しに失敗: ${errorText(err)}`);
+  }
 
+  const { ctx, hostEmails } = await messageContext(env, base, cal, updated);
+  // 担当から外れた人にも知らせる
+  const emails = [...new Set([...hostEmails, ...oldHosts.map((h) => h.email)])];
+  const mails: Mail[] = [{ kind: 'rescheduled', to: updated.guest_email, bookingId: b.id, ...rescheduledMail(ctx, old, true) }];
+  for (const to of hostRecipients(settings, emails)) mails.push({ kind: 'rescheduled', to, bookingId: b.id, ...rescheduledMail(ctx, old, false) });
+  const queued = await queueMails(env, mails);
   defer(
     (async () => {
-      const { ctx, hostEmails } = await messageContext(env, base, cal, updated);
-      // 担当から外れた人にも知らせる
-      const emails = [...new Set([...hostEmails, ...oldHosts.map((h) => h.email)])];
-      const mails: Mail[] = [{ kind: 'rescheduled', to: updated.guest_email, bookingId: b.id, ...rescheduledMail(ctx, old, true) }];
-      for (const to of hostRecipients(settings, emails)) mails.push({ kind: 'rescheduled', to, bookingId: b.id, ...rescheduledMail(ctx, old, false) });
-      await sendMails(env, mails);
+      await deliverMails(env, queued);
       await postWebhook(settings.webhookUrl, webhookPayload('booking.rescheduled', cal, ctx));
       await postSlack(settings.slackWebhookUrl, `:arrows_counterclockwise: 日程変更: ${updated.guest_name}様（${cal.name}）\n${rescheduledMail(ctx, old, false).subject}`);
     })(),
