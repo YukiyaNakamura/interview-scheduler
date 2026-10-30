@@ -1,14 +1,17 @@
 /**
- * URL とページの対応表（docs/01「画面」）。ログインはない。
- * /admin/** は管理画面（AppLayout の中）、/c/:slug と /r/:token は応募画面。/ と旧 /app/* は /admin へ
+ * URL とページの対応表（docs/01「画面」）。
+ * /admin/** は管理画面（AppLayout の中。ログインが要る）、/login は管理画面のログイン、/c/:slug と /r/:token は応募画面（ログインなし）。
+ * / と旧 /app/* は /admin へ
  */
 import { Navigate, createBrowserRouter } from 'react-router';
 import { AppLayout } from './components/AppLayout';
+import { AccountsPage } from './pages/AccountsPage';
 import { BookingDetailPage } from './pages/BookingDetailPage';
 import { BookingsPage } from './pages/BookingsPage';
 import { CalendarEditPage } from './pages/CalendarEditPage';
 import { CalendarsPage } from './pages/CalendarsPage';
 import { CandidatesNewPage } from './pages/CandidatesNewPage';
+import { LoginPage } from './pages/LoginPage';
 import { MembersPage } from './pages/MembersPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 import { OutboxPage } from './pages/OutboxPage';
@@ -21,7 +24,7 @@ export const router = createBrowserRouter([
   { path: '/', element: toAdmin },
   { path: '/app', element: toAdmin },
   { path: '/app/*', element: toAdmin },
-  { path: '/login', element: toAdmin },
+  { path: '/login', Component: LoginPage },
   {
     path: '/admin',
     Component: AppLayout,
@@ -34,6 +37,7 @@ export const router = createBrowserRouter([
       { path: 'bookings/:id', Component: BookingDetailPage },
       { path: 'members', Component: MembersPage },
       { path: 'outbox', Component: OutboxPage },
+      { path: 'accounts', Component: AccountsPage },
       { path: '*', Component: NotFoundPage },
     ],
   },

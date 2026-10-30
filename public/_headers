@@ -1,0 +1,17 @@
+# 画面（dist/web）の応答に付けるヘッダー（Cloudflare Workers の静的アセットの _headers）。API の応答は src/worker/index.ts の secureHeaders
+# Referrer-Policy: 予定確認 URL（/r/<トークン>）やワンタイム URL（?ot=）をほかのサイトへ送らない
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: same-origin
+
+# 管理画面とログインは、ほかのサイトの中に埋め込ませず（クリックジャッキング対策）、自分のサイト以外のスクリプトを動かさない（XSS 対策）。
+# 応募画面（/c/*）は埋め込みウィジェットで使うので対象外
+/admin
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'
+/admin/*
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'
+/login
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'
