@@ -204,7 +204,7 @@ export function defaultSettings(weekly: Weekly = DEFAULT_WEEKLY, timezone = 'Asi
     window: { mode: 'auto', minNoticeHours: 24, daysAhead: 30 },
     slotIntervalMin: 30,
     limit: null,
-    notifyNoSlot: true,
+    notifyNoSlot: false,
     cancelDeadlineHours: null,
     allowGuestCancel: true,
     allowGuestReschedule: true,

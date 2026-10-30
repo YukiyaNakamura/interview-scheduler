@@ -16,6 +16,8 @@ export interface CalendarRow {
   status: 'open' | 'closed';
   /** 復号した設定の JSON */
   settings: string;
+  /** 削除（アーカイブ）した日時。アーカイブしたカレンダーは一覧と応募画面に出ないが、予定の記録のために残す */
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -45,13 +47,14 @@ export async function getCalendar(db: D1Database, id: string): Promise<CalendarR
   return row ? toCalendarRow(row) : null;
 }
 
+/** 応募画面用。アーカイブしたカレンダーは見つからない扱い */
 export async function getCalendarBySlug(db: D1Database, slug: string): Promise<CalendarRow | null> {
-  const row = await db.prepare('SELECT * FROM booking_calendars WHERE slug = ?').bind(slug).first<CalendarDbRow>();
+  const row = await db.prepare('SELECT * FROM booking_calendars WHERE slug = ? AND archived_at IS NULL').bind(slug).first<CalendarDbRow>();
   return row ? toCalendarRow(row) : null;
 }
 
 export async function listCalendars(db: D1Database): Promise<CalendarRow[]> {
-  const { results } = await db.prepare('SELECT * FROM booking_calendars ORDER BY created_at DESC').all<CalendarDbRow>();
+  const { results } = await db.prepare('SELECT * FROM booking_calendars WHERE archived_at IS NULL ORDER BY created_at DESC').all<CalendarDbRow>();
   return Promise.all(results.map(toCalendarRow));
 }
 
@@ -63,8 +66,8 @@ export async function listMembers(db: D1Database, calendarId: string): Promise<C
 export async function listMembersForCalendars(db: D1Database, calendarIds: string[]): Promise<CalendarMemberRow[]> {
   if (calendarIds.length === 0) return [];
   const { results } = await db
-    .prepare(`SELECT * FROM calendar_members WHERE calendar_id IN (${calendarIds.map(() => '?').join(',')}) ORDER BY priority, rowid`)
-    .bind(...calendarIds)
+    .prepare(`SELECT * FROM calendar_members WHERE calendar_id IN (SELECT value FROM json_each(?)) ORDER BY priority, rowid`)
+    .bind(JSON.stringify(calendarIds))
     .all<CalendarMemberRow>();
   return results;
 }
@@ -132,9 +135,16 @@ export async function updateCalendar(db: D1Database, id: string, data: CalendarW
   ]);
 }
 
-export async function deleteCalendar(db: D1Database, id: string): Promise<void> {
-  // 予定（bookings）も ON DELETE CASCADE で消える。D1 は外部キーを既定で有効にしている
-  await db.prepare('DELETE FROM booking_calendars WHERE id = ?').bind(id).run();
+/**
+ * カレンダーの削除。行は消さずにアーカイブする（DELETE すると予定も ON DELETE CASCADE で消え、選考の記録がなくなるため）。
+ * 受付を止め、URL（スラッグ）は空けて同じ URL で新しいカレンダーを作れるようにする（'.' はスラッグに使えない文字なので重ならない）
+ */
+export async function archiveCalendar(db: D1Database, id: string): Promise<void> {
+  const now = nowIso();
+  await db
+    .prepare("UPDATE booking_calendars SET archived_at = ?, status = 'closed', slug = slug || '.archived.' || id, updated_at = ? WHERE id = ? AND archived_at IS NULL")
+    .bind(now, now, id)
+    .run();
 }
 
 export async function toCalendarDetail(db: D1Database, row: CalendarRow, baseUrl: string): Promise<CalendarDetail> {

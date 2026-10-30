@@ -1,5 +1,5 @@
 /** 応募者用の公開 API（ログイン不要。docs/01「API」応募者用） */
-import { Hono } from 'hono';
+import { type Context, Hono } from 'hono';
 import { z } from 'zod';
 import type { BookingCreateResponse, MessageResponse, PublicCalendar, SlotsResponse } from '../../shared/api';
 import { type CalendarSettings, LOCATION_LABELS } from '../../shared/schema';
@@ -12,6 +12,7 @@ import { guestLinksMail, noSlotMail } from '../services/messages';
 import { sendMail, sendMails } from '../integrations/notify';
 import { buildIcs } from '../lib/ics';
 import { LIMITS, reserveAll } from '../lib/limits';
+import { timingSafeEqual } from '../lib/password';
 import { emailIndex } from '../lib/pii';
 import { clientInfo } from '../lib/session';
 import { appUrl, HttpError, manageUrl } from '../lib/util';
@@ -25,9 +26,24 @@ async function calendarBySlug(db: D1Database, slug: string): Promise<{ cal: Cale
   return { cal, settings: parseSettings(cal.settings) };
 }
 
-/** 閲覧パスワードの確認（ヘッダー x-calendar-password） */
-function passwordOk(settings: CalendarSettings, given: string | undefined): boolean {
-  return settings.password === '' || given === settings.password;
+/** 2つの文字列が同じか。かかる時間から一致した長さが分からないよう、ハッシュにしてから一定時間で比べる */
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  const digest = async (v: string) => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)));
+  return timingSafeEqual(await digest(a), await digest(b));
+}
+
+/**
+ * 閲覧パスワードの確認（ヘッダー x-calendar-password）。総当たりされないよう、試すたびに数え（lib/limits.ts）、正しければ戻す。
+ * パスワードを入れていない（ロック画面を出すだけの）ときは数えない
+ */
+async function passwordOk(c: Context<AppEnv>, cal: CalendarRow, settings: CalendarSettings): Promise<boolean> {
+  if (settings.password === '') return true;
+  const given = c.req.header('x-calendar-password');
+  if (!given) return false;
+  const attempt = await reserveAll(c, [LIMITS.calendarPassword(clientInfo(c).ip, cal.id)]);
+  const ok = await sameSecret(given, settings.password);
+  if (ok) await attempt.release();
+  return ok;
 }
 
 /** 受け付けられない理由。受け付けられるなら null */
@@ -45,7 +61,7 @@ async function closedReasonOf(db: D1Database, cal: CalendarRow, settings: Calend
 
 publicApi.get('/c/:slug', async (c) => {
   const { cal, settings } = await calendarBySlug(c.env.DB, c.req.param('slug'));
-  const locked = !passwordOk(settings, c.req.header('x-calendar-password'));
+  const locked = !(await passwordOk(c, cal, settings));
   const base: PublicCalendar = {
     slug: cal.slug,
     kind: cal.kind,
@@ -102,7 +118,7 @@ publicApi.get('/c/:slug/slots', async (c) => {
   if (q.reschedule) {
     exclude = await getBookingByToken(c.env.DB, q.reschedule);
     if (!exclude || exclude.calendar_id !== cal.id || exclude.status !== 'confirmed') throw new HttpError(404, '予定が見つかりません');
-  } else if (!passwordOk(settings, c.req.header('x-calendar-password'))) {
+  } else if (!(await passwordOk(c, cal, settings))) {
     throw new HttpError(403, 'パスワードが違います');
   } else if (await closedReasonOf(c.env.DB, cal, settings, q.ot)) {
     return c.json<SlotsResponse>({ slots: [] });
@@ -123,16 +139,19 @@ const bookingInputSchema = z.object({
 
 publicApi.post('/c/:slug/bookings', async (c) => {
   const { cal, settings } = await calendarBySlug(c.env.DB, c.req.param('slug'));
-  if (!passwordOk(settings, c.req.header('x-calendar-password'))) throw new HttpError(403, 'パスワードが違います');
+  if (!(await passwordOk(c, cal, settings))) throw new HttpError(403, 'パスワードが違います');
   const input = bookingInputSchema.parse(await c.req.json());
+  await reserveAll(c, [LIMITS.bookingIp(clientInfo(c).ip)]);
   const b = await confirmBooking(c.env, (p) => c.executionCtx.waitUntil(p), appUrl(c.env, c), cal, input);
   return c.json<BookingCreateResponse>({ booking: await toPublicBooking(c.env, b, cal), redirectUrl: settings.redirectUrl || null }, 201);
 });
 
 publicApi.post('/c/:slug/no-slot', async (c) => {
   const { cal, settings } = await calendarBySlug(c.env.DB, c.req.param('slug'));
-  if (!settings.notifyNoSlot || !passwordOk(settings, c.req.header('x-calendar-password'))) throw new HttpError(404, 'Not Found');
+  if (!settings.notifyNoSlot || !(await passwordOk(c, cal, settings))) throw new HttpError(404, 'Not Found');
   const input = z.object({ name: z.string().trim().min(1, '名前を入力してください').max(100), email: z.email('メールアドレスが正しくありません'), message: z.string().max(2000) }).parse(await c.req.json());
+  // 1回で面接官全員と通知先にメールが届くので、IP ごと・カレンダーごとに回数を絞る
+  await reserveAll(c, [LIMITS.noSlotIp(clientInfo(c).ip), LIMITS.noSlotCalendar(cal.id)]);
   const members = await listMembers(c.env.DB, cal.id);
   const users = await getMembersByIds(c.env.DB, members.map((m) => m.member_id));
   const mail = noSlotMail(c.env.APP_NAME, cal.name, input);

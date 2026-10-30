@@ -10,7 +10,8 @@
     "test": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply interview-scheduler-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply interview-scheduler-db --remote",
-    "deploy": "npm run build && wrangler deploy"
+    "check:deploy": "node scripts/check-deploy.mjs",
+    "deploy": "npm run typecheck && npm test && npm run check:deploy && npm run db:migrate:remote && npm run build && wrangler deploy"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.105.0",

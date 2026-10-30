@@ -10,6 +10,7 @@ import { ZodError } from 'zod';
 import type { ApiError, AppConfig } from '../shared/api';
 import type { AppEnv, Bindings } from './env';
 import { googleEnabled } from './integrations/google';
+import { retryMails } from './integrations/notify';
 import { runCleanup, runReminders } from './jobs/reminders';
 import { configurePii } from './lib/pii';
 import { noStore, requireAdmin, sameOriginWrites } from './lib/session';
@@ -44,6 +45,9 @@ app.route('/auth/google', google);
 
 app.notFound((c) => c.json<ApiError>({ error: 'Not Found' }, 404));
 
+/** ログに出すパス。応募者の予定確認トークン（/api/public/bookings/<token>）は伏せる（ログを見られる人が予定を操作できないように） */
+const redactPath = (path: string) => path.replace(/^(\/api\/public\/bookings\/)[^/]+/, '$1…');
+
 app.onError((err, c) => {
   if (err instanceof HttpError) return c.json<ApiError>({ error: err.message, issues: err.issues }, err.status);
   if (err instanceof ZodError) {
@@ -51,7 +55,7 @@ app.onError((err, c) => {
     return c.json<ApiError>({ error: issues[0]?.message ?? '入力内容を確認してください', issues }, 400);
   }
   if (err instanceof SyntaxError) return c.json<ApiError>({ error: 'JSON が正しくありません' }, 400);
-  console.log(`[error] ${c.req.method} ${c.req.path}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+  console.error(`[error] ${c.req.method} ${redactPath(c.req.path)}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
   return c.json<ApiError>({ error: 'サーバーでエラーが起きました。時間をおいてもう一度お試しください' }, 500);
 });
 
@@ -59,7 +63,13 @@ export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
     configurePii(env.TOKEN_ENC_KEY);
-    if (controller.cron === '0 18 * * *') ctx.waitUntil(runCleanup(env));
-    else ctx.waitUntil(runReminders(env).then((n) => console.log(`[reminders] ${n} 件送信`)));
+    const run = (name: string, job: () => Promise<unknown>) =>
+      job().catch((err) => console.error(`[cron] ${name} に失敗: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`));
+    if (controller.cron === '0 18 * * *') {
+      ctx.waitUntil(run('cleanup', () => runCleanup(env)));
+    } else {
+      ctx.waitUntil(run('reminders', () => runReminders(env).then((n) => console.log(`[reminders] ${n} 件送信`))));
+      ctx.waitUntil(run('retry-mails', () => retryMails(env).then((n) => n > 0 && console.log(`[mail] ${n} 件を送り直しました`))));
+    }
   },
 } satisfies ExportedHandler<Bindings>;

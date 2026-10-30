@@ -314,6 +314,8 @@ export interface BookingDetail extends BookingSummary {
 /** GET /api/admin/bookings?scope=upcoming|past|cancelled&calendarId=&q= */
 export interface BookingListResponse {
   bookings: BookingSummary[];
+  /** 続きがあれば、次のページを読むときに ?after= に渡す値 */
+  nextCursor: string | null;
 }
 
 /** GET /api/admin/outbox の1件 */
@@ -322,9 +324,12 @@ export interface OutboxItem {
   kind: string;
   toAddr: string;
   subject: string;
+  /** 本文。送り終えたものは空（EMAIL_PROVIDER=log の記録だけ残る） */
   body: string;
-  status: 'logged' | 'sent' | 'failed';
+  /** 'pending' は送信待ち（送れなかったものは間隔を空けて送り直す） */
+  status: 'logged' | 'pending' | 'sent' | 'failed';
   error: string | null;
+  attempts: number;
   createdAt: string;
 }
 

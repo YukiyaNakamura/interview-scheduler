@@ -94,7 +94,10 @@ export async function listUpcomingBookingsByEmail(db: D1Database, email: string)
   return Promise.all(results.map(toBookingRow));
 }
 
-/** 予定の担当メンバー。名前・メールは今のメンバー情報を優先し、削除済みなら予定を作ったときの控えを使う */
+/**
+ * 予定の担当メンバー。名前・メールは今のメンバー情報を優先し、削除済みなら予定を作ったときの控えを使う。
+ * D1 は1つのクエリに渡せる値が100個までなので、ID の一覧は JSON 1つにして json_each で展開する（ほかの IN も同じ）
+ */
 export async function listBookingHosts(db: D1Database, bookingIds: string[]): Promise<(BookingHostRow & { name: string; email: string })[]> {
   if (bookingIds.length === 0) return [];
   const { results } = await db
@@ -102,9 +105,9 @@ export async function listBookingHosts(db: D1Database, bookingIds: string[]): Pr
       `SELECT h.booking_id, h.member_id, h.member_name, h.start_at, h.active, h.external_event,
          COALESCE(m.name, h.member_name) AS name, COALESCE(m.email_enc, h.member_email_enc) AS email_enc
        FROM booking_hosts h LEFT JOIN members m ON m.id = h.member_id
-       WHERE h.booking_id IN (${bookingIds.map(() => '?').join(',')}) ORDER BY h.rowid`,
+       WHERE h.booking_id IN (SELECT value FROM json_each(?)) ORDER BY h.rowid`,
     )
-    .bind(...bookingIds)
+    .bind(JSON.stringify(bookingIds))
     .all<BookingHostRow & { name: string; email_enc: string }>();
   return Promise.all(results.map(async ({ email_enc, ...h }) => ({ ...h, email: await open(email_enc) })));
 }
@@ -124,11 +127,23 @@ export async function listInternalBusy(
   const { results } = await db
     .prepare(
       `SELECT h.member_id, b.block_start_at, b.block_end_at FROM booking_hosts h JOIN bookings b ON b.id = h.booking_id
-       WHERE h.active = 1 AND h.member_id IN (${memberIds.map(() => '?').join(',')})
+       WHERE h.active = 1 AND h.member_id IN (SELECT value FROM json_each(?))
          AND b.block_end_at > ? AND b.block_start_at < ? AND b.id != ?`,
     )
-    .bind(...memberIds, from, to, excludeBookingId ?? '')
+    .bind(JSON.stringify(memberIds), from, to, excludeBookingId ?? '')
     .all<{ member_id: string; block_start_at: string; block_end_at: string }>();
+  return results;
+}
+
+/** このカレンダーでそのメンバーが担当している確定予定（確定した順。同時に確定されたときの上限の数え直しに使う） */
+export async function listMemberAssignments(db: D1Database, calendarId: string, memberId: string): Promise<{ booking_id: string; start_at: string }[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT b.id AS booking_id, b.start_at FROM booking_hosts h JOIN bookings b ON b.id = h.booking_id
+       WHERE b.calendar_id = ? AND h.member_id = ? AND b.status = 'confirmed' AND h.active = 1 ORDER BY b.rowid`,
+    )
+    .bind(calendarId, memberId)
+    .all<{ booking_id: string; start_at: string }>();
   return results;
 }
 
@@ -148,9 +163,17 @@ export interface BookingFilter {
   scope: 'upcoming' | 'past' | 'cancelled' | 'all';
   calendarId?: string;
   q?: string;
+  /** ページ送り: 前のページの最後の予定（listBookings の nextCursor） */
+  after?: string;
 }
 
-export async function listBookings(db: D1Database, f: BookingFilter, limit = 500): Promise<(BookingRow & { calendar_name: string })[]> {
+/** ページ送りの目印（開始日時と id）。並び順は開始日時→id */
+const cursorOf = (b: Pick<BookingRow, 'start_at' | 'id'>) => `${b.start_at}|${b.id}`;
+
+/**
+ * 予定の一覧。limit 件ずつ返し、続きがあれば nextCursor を返す（filter.after に渡すと続きが読める）
+ */
+export async function listBookings(db: D1Database, f: BookingFilter, limit = 50): Promise<{ rows: (BookingRow & { calendar_name: string })[]; nextCursor: string | null }> {
   const where = ['1 = 1'];
   const values: unknown[] = [];
   const now = new Date().toISOString();
@@ -164,12 +187,21 @@ export async function listBookings(db: D1Database, f: BookingFilter, limit = 500
     const like = `%${f.q.replace(/[%_]/g, '')}%`;
     values.push(like, like, await emailIndex(f.q));
   }
-  const order = f.scope === 'upcoming' ? 'b.start_at ASC' : 'b.start_at DESC';
+  const asc = f.scope === 'upcoming';
+  const [afterStart, afterId] = f.after?.split('|') ?? [];
+  if (afterStart && afterId) {
+    where.push(asc ? '(b.start_at > ? OR (b.start_at = ? AND b.id > ?))' : '(b.start_at < ? OR (b.start_at = ? AND b.id < ?))');
+    values.push(afterStart, afterStart, afterId);
+  }
+  const order = asc ? 'b.start_at ASC, b.id ASC' : 'b.start_at DESC, b.id DESC';
+  // 1件多く読んで、続きがあるかを知る
   const { results } = await db
     .prepare(`SELECT b.*, c.name AS calendar_name FROM bookings b JOIN booking_calendars c ON c.id = b.calendar_id WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ?`)
-    .bind(...values, limit)
+    .bind(...values, limit + 1)
     .all<BookingDbRow & { calendar_name: string }>();
-  return Promise.all(results.map(toBookingRow));
+  const rows = await Promise.all(results.slice(0, limit).map(toBookingRow));
+  const last = rows.at(-1);
+  return { rows, nextCursor: results.length > limit && last ? cursorOf(last) : null };
 }
 
 export async function countUpcomingByCalendar(db: D1Database): Promise<Map<string, number>> {
@@ -215,7 +247,7 @@ export function toBookingDetail(b: BookingRow, calendarName: string, hosts: { me
   };
 }
 
-// ---- 送信ログ ----
+// ---- 送信ログ（メールの送信待ちを兼ねる） ----
 
 /** 復号済みの送信ログ（DB では to_addr_enc / subject_enc / body_enc） */
 export interface OutboxRow {
@@ -223,31 +255,94 @@ export interface OutboxRow {
   kind: string;
   to_addr: string;
   subject: string;
+  /** 本文。送り終えた行は空（送り直しのためだけに持つ。EMAIL_PROVIDER=log の 'logged' は残す） */
   body: string;
   booking_id: string | null;
-  status: 'logged' | 'sent' | 'failed';
+  status: 'logged' | 'pending' | 'sent' | 'failed';
   error: string | null;
+  attempts: number;
   created_at: string;
 }
 
-/** 送信ログ（新しい順） */
+type OutboxDbRow = Omit<OutboxRow, 'to_addr' | 'subject' | 'body'> & { to_addr_enc: string; subject_enc: string; body_enc: string; reply_to_enc: string | null; next_attempt_at: string | null };
+
+/** 送信ログ（新しい順）。本文は 'logged'（開発用に送らず残しただけのもの）のときだけ返す */
 export async function listOutbox(db: D1Database, limit = 200): Promise<OutboxRow[]> {
-  const { results } = await db
-    .prepare('SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT ?')
-    .bind(limit)
-    .all<Omit<OutboxRow, 'to_addr' | 'subject' | 'body'> & { to_addr_enc: string; subject_enc: string; body_enc: string }>();
+  const { results } = await db.prepare('SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT ?').bind(limit).all<OutboxDbRow>();
   return Promise.all(
-    results.map(async ({ to_addr_enc, subject_enc, body_enc, ...r }) => ({ ...r, to_addr: await open(to_addr_enc), subject: await open(subject_enc), body: await open(body_enc) })),
+    results.map(async ({ to_addr_enc, subject_enc, body_enc, reply_to_enc: _r, next_attempt_at: _n, ...r }) => ({
+      ...r,
+      to_addr: await open(to_addr_enc),
+      subject: await open(subject_enc),
+      body: r.status === 'logged' && body_enc ? await open(body_enc) : '',
+    })),
   );
 }
 
-/** 送信ログに1件残す（宛先・件名・本文は暗号化する） */
+/** 送信ログに1件入れる（宛先・件名・本文は暗号化する）。'pending' は nextAttemptAt を過ぎたら定時実行が送り直す */
 export async function insertOutbox(
   db: D1Database,
-  m: { id: string; kind: string; to: string; subject: string; body: string; bookingId: string | null; status: OutboxRow['status']; error: string | null; createdAt: string },
+  m: { id: string; kind: string; to: string; subject: string; body: string; replyTo: string | null; bookingId: string | null; status: OutboxRow['status']; nextAttemptAt: string | null; createdAt: string },
 ): Promise<void> {
   await db
-    .prepare('INSERT INTO email_outbox (id, kind, to_addr_enc, subject_enc, body_enc, booking_id, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(m.id, m.kind, await seal(m.to), await seal(m.subject), await seal(m.body), m.bookingId, m.status, m.error, m.createdAt)
+    .prepare(
+      'INSERT INTO email_outbox (id, kind, to_addr_enc, subject_enc, body_enc, reply_to_enc, booking_id, status, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .bind(m.id, m.kind, await seal(m.to), await seal(m.subject), await seal(m.body), m.replyTo ? await seal(m.replyTo) : null, m.bookingId, m.status, m.nextAttemptAt, m.createdAt)
     .run();
+}
+
+/** 送り直す時刻を過ぎた 'pending'（復号済み） */
+export async function listDueOutbox(
+  db: D1Database,
+  now: string,
+  limit = 50,
+): Promise<{ id: string; kind: string; to: string; subject: string; body: string; replyTo: string | null; bookingId: string | null; attempts: number; nextAttemptAt: string }[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM email_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY next_attempt_at LIMIT ?")
+    .bind(now, limit)
+    .all<OutboxDbRow>();
+  return Promise.all(
+    results.map(async (r) => ({
+      id: r.id,
+      kind: r.kind,
+      to: await open(r.to_addr_enc),
+      subject: await open(r.subject_enc),
+      body: await open(r.body_enc),
+      replyTo: r.reply_to_enc ? await open(r.reply_to_enc) : null,
+      bookingId: r.booking_id,
+      attempts: r.attempts,
+      nextAttemptAt: r.next_attempt_at!,
+    })),
+  );
+}
+
+/** 送り直しを始める前に次の試行時刻を先へ進める。進められなければ（別の実行が先に取った）false */
+export async function claimOutbox(db: D1Database, id: string, seenNextAttemptAt: string, until: string): Promise<boolean> {
+  const res = await db.prepare("UPDATE email_outbox SET next_attempt_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at = ?").bind(until, id, seenNextAttemptAt).run();
+  return res.meta.changes === 1;
+}
+
+/**
+ * 1回送ってみた結果を残す。送れた・あきらめた（'sent' / 'failed'）ときは本文と返信先を消す。
+ * まだ送り直すとき（'pending'）は試行回数と次の時刻を入れる
+ */
+export async function recordOutboxAttempt(
+  db: D1Database,
+  id: string,
+  r: { status: 'pending' | 'sent' | 'failed'; attempts: number; error: string | null; nextAttemptAt: string | null },
+): Promise<void> {
+  const done = r.status !== 'pending';
+  await db
+    .prepare(
+      `UPDATE email_outbox SET status = ?1, attempts = ?2, error = ?3, next_attempt_at = ?4,
+         body_enc = CASE WHEN ?5 THEN '' ELSE body_enc END, reply_to_enc = CASE WHEN ?5 THEN NULL ELSE reply_to_enc END WHERE id = ?6`,
+    )
+    .bind(r.status, r.attempts, r.error, r.nextAttemptAt, done ? 1 : 0, id)
+    .run();
+}
+
+/** 古い送信ログを消す（宛先・件名も個人情報なので長く持たない） */
+export async function deleteOldOutbox(db: D1Database, before: string): Promise<void> {
+  await db.prepare('DELETE FROM email_outbox WHERE created_at < ?').bind(before).run();
 }

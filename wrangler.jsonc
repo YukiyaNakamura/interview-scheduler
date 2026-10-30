@@ -24,10 +24,16 @@
     ]
   },
 
-  // 公開されてよい設定値。秘密情報（GOOGLE_CLIENT_SECRET など）は .dev.vars / wrangler secret に置く
+  // 公開されてよい設定値（本番の値）。秘密情報（GOOGLE_CLIENT_SECRET など）は .dev.vars / wrangler secret に置く。
+  // 手元では .dev.vars の EMAIL_PROVIDER=log が優先され、メールは送らずに送信ログに残るだけになる
   "vars": {
     "APP_NAME": "Aiteru",
-    "EMAIL_PROVIDER": "log"
+    "EMAIL_PROVIDER": "resend"
+  },
+
+  // Workers Logs（console.log / console.error をダッシュボードで見られるようにする）。ログに個人情報やトークンは出さない
+  "observability": {
+    "enabled": true
   },
 
   // D1（全データ）。本番は `wrangler d1 create interview-scheduler-db` で作り、database_id を差し替える
