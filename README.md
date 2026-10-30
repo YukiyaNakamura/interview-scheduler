@@ -1,9 +1,9 @@
 # Aiteru（面接の日程調整）
 
-TimeRex の仕様をもとにした面接の日程調整 Web アプリ。**ログインはない。**
+TimeRex の仕様をもとにした面接の日程調整 Web アプリ。
 
-- **管理画面** `/admin`: 面接官（メンバー）を登録し、日程調整カレンダーを作って URL を応募者に送る。確定した予定の確認・キャンセル・CSV
-- **応募画面** `/c/<URL>`: 応募者は日時を選び、名前とメールアドレスを入れるだけで面接が確定する
+- **管理画面** `/admin`（**ログインが要る**: パスワード＋2段階認証）: 面接官（メンバー）を登録し、日程調整カレンダーを作って URL を応募者に送る。確定した予定の確認・キャンセル・CSV
+- **応募画面** `/c/<URL>`（ログインなし）: 応募者は日時を選び、名前とメールアドレスを入れるだけで面接が確定する
 
 - 仕様: [docs/00_spec.md](docs/00_spec.md)（✅ 実装済み / 🔜 未実装 の一覧つき）
 - 構成・API・画面: [docs/01_architecture.md](docs/01_architecture.md)
@@ -17,11 +17,13 @@ npm run db:migrate:local   # 手元の D1 にテーブルを作る
 npm run dev                # http://localhost:5180
 ```
 
-http://localhost:5180/admin を開き、「メンバー」で面接官を登録 →「日程調整カレンダー」で新規作成 → URL を開くと応募画面。
+http://localhost:5180/admin を開くとログイン画面になる。初回は「最初の管理者を作る」が出るので、`.dev.vars` の `ADMIN_SETUP_TOKEN` を入れて自分のアカウントを作り、
+スマホの認証アプリ（Google Authenticator など）で QR コードを読み取って6桁のコードを入れる。
+ログインしたら「メンバー」で面接官を登録 →「日程調整カレンダー」で新規作成 → URL を開くと応募画面。
 メールは `EMAIL_PROVIDER=log` なので実際には送らず、管理画面の「送信ログ」で中身を確認できる。
 
 ```sh
-npm test            # 空き枠計算・リマインド時刻のテスト
+npm test            # 空き枠計算・リマインド時刻・パスワード・2段階認証のテスト
 npm run typecheck
 ```
 
@@ -44,6 +46,7 @@ npm run typecheck
 npx wrangler d1 create interview-scheduler-db   # 出てきた database_id を wrangler.jsonc に書く
 npm run db:migrate:remote
 npx wrangler secret put TOKEN_ENC_KEY          # openssl rand -base64 32
+npx wrangler secret put ADMIN_SETUP_TOKEN      # 最初の管理者を作るときの合言葉。openssl rand -base64 24
 npx wrangler secret put GOOGLE_CLIENT_ID
 npx wrangler secret put GOOGLE_CLIENT_SECRET
 npx wrangler secret put APP_URL                # 例: https://interview-scheduler.<サブドメイン>.workers.dev
@@ -54,18 +57,32 @@ npx wrangler secret put EMAIL_FROM             # 例: 採用担当 <noreply@your
 npm run deploy
 ```
 
-### 管理画面を守る（本番では必須）
+### 最初の管理者を作る
 
-ログインがないので、そのまま公開すると **URL を知っている人は誰でも管理画面で応募者の名前・メールを見られる。**
-Cloudflare ダッシュボード → Zero Trust → Access → Applications で「Self-hosted」アプリを作り、次の3つのパスだけを社内のメールアドレスに限定する（アプリのコードは変更不要）:
+デプロイしたら、すぐに `https://<本番URL>/login` を開き、`ADMIN_SETUP_TOKEN` に入れた合言葉で最初の管理者を作る。
+合言葉を知らない人は作れず、管理者が1人できた後はこの画面は出ない。2人目からは管理画面の「アカウント」で追加する
+（仮パスワードが1回だけ表示されるので、メール以外の方法で本人に伝える）。
+作り終えたら `npx wrangler secret delete ADMIN_SETUP_TOKEN` で合言葉を消しておくとより安全（初期設定をやり直すときにまた入れる）。
 
-- `<本番ドメイン>/admin*`
-- `<本番ドメイン>/api/admin/*`
-- `<本番ドメイン>/auth/*`
+### ログインの仕組み（詳しくは docs/01「ログイン」）
 
-応募画面（`/c/*` `/r/*` `/api/public/*`）は誰でも開けるままにする。
+- 管理画面と管理 API はパスワード＋2段階認証（認証アプリの6桁）が必須。応募画面（`/c/*` `/r/*` `/api/public/*`）はログインなし
+- パスワードは同じメールアドレスで15分に5回・同じ IP で20回、2段階認証のコードは24時間に10回まで。超えるとロックし、ほかの管理者がリセットすると解ける。ログインの記録は「アカウント」画面で見られる
+- さらに守りたいときは、Cloudflare Zero Trust → Access で `/admin*` `/api/admin/*` `/api/auth/*` `/auth/*` `/login` を社内のメールアドレスに限定できる（任意。アプリのコードは変更不要）
+
+### 管理者が1人でログインできなくなったとき
+
+ほかに管理者がいれば、その人に「アカウント」画面から「パスワード再発行」か「2段階認証をやり直す」をしてもらう。
+管理者が1人だけで、パスワードを忘れた・スマホをなくしたときは、Cloudflare の権限がある人が次を実行すると、その人を消して初期設定からやり直せる
+（予定やカレンダーは消えない）:
+
+```sh
+npx wrangler d1 execute interview-scheduler-db --remote --command "DELETE FROM admin_users WHERE email = '<メールアドレス>'"
+# そのあと /login を開くと「最初の管理者を作る」が出る（ADMIN_SETUP_TOKEN が要る。消していたら wrangler secret put で入れ直す）
+```
 
 ## まだ無いもの（docs/00 の 🔜）
 
 Zoom / Microsoft Teams の URL 自動発行、Outlook 予定表連携、質問のファイルアップロード、グループ投票・セミナー・ルーティング、
-候補を選んで日程調整の「仮予定」登録、確定後の参加者変更、応募画面のボット対策（Turnstile）。
+候補を選んで日程調整の「仮予定」登録、確定後の参加者変更、応募画面のボット対策（Turnstile）、
+Google / Microsoft アカウントでの管理画面ログイン、パスワードを忘れたときのメールでの自分でのリセット。

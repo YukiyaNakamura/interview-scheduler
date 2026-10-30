@@ -15,7 +15,7 @@ export const nowIso = (): string => new Date().toISOString();
 /** API で返すエラー。index.ts の onError が { error } の JSON にする */
 export class HttpError extends Error {
   constructor(
-    public status: 400 | 401 | 403 | 404 | 409 | 410 | 422 | 500 | 502,
+    public status: 400 | 401 | 403 | 404 | 409 | 410 | 422 | 429 | 500 | 502,
     message: string,
     /** 入力チェックのエラーの詳細（項目 → メッセージ） */
     public issues?: { path: string; message: string }[],

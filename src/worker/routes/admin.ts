@@ -1,6 +1,6 @@
 /**
- * 管理画面の API（/api/admin/*。docs/01「API」）。ログインはない。
- * 本番では Cloudflare Access で /admin* と /api/admin/* を社内に限定する（docs/01「ログイン」）
+ * 管理画面の API（/api/admin/*。docs/01「API」）。index.ts の requireAdmin でログイン済みの管理者だけが通る。
+ * 管理者アカウントの管理は routes/accounts.ts
  */
 import { Hono } from 'hono';
 import { z } from 'zod';

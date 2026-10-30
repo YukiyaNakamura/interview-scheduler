@@ -4,6 +4,7 @@
  * - 送信時刻を過ぎてから確定した予定も、予定当日 0:00 までに確定していれば次の実行で送る。当日 0:01 以降に確定したものには送らない
  */
 import { addDays, zonedParts, zonedToUtc } from '../../shared/time';
+import { cleanupAuth } from '../db/auth';
 import type { BookingRow } from '../db/bookings';
 import { parseSettings } from '../db/calendars';
 import { listBookingHosts } from '../db/bookings';
@@ -58,6 +59,7 @@ export async function runReminders(env: Bindings, now = new Date()): Promise<num
 /** 期限切れの OAuth state を消す */
 export async function runCleanup(env: Bindings): Promise<void> {
   await env.DB.prepare('DELETE FROM oauth_states WHERE created_at < ?').bind(new Date(Date.now() - 3_600_000).toISOString()).run();
+  await cleanupAuth(env.DB);
 }
 
 

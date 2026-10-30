@@ -13,7 +13,7 @@ const IV_BYTES = 12;
  * base64 の文字列 → バイト列（Uint8Array）。atob はブラウザ・Workers・Node に共通の関数。
  * 戻り値の型 Uint8Array<ArrayBuffer> は「普通のメモリ上のバイト列」という意味で、crypto.subtle に渡すのに必要
  */
-function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
+export function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   try {
     return Uint8Array.from(atob(base64), (ch) => ch.charCodeAt(0));
   } catch {
@@ -22,7 +22,7 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
 }
 
 /** バイト列 → base64 の文字列 */
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
 }
 

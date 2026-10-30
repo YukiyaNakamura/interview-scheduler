@@ -1,7 +1,7 @@
 /**
  * Worker と画面の間の API の型（ここが正）。エンドポイントの一覧は docs/01_architecture.md「API」。
  * 日時（*At）はすべて UTC の ISO 文字列。
- * ログインはない。管理画面の API は /api/admin/*、応募者（ゲスト）の API は /api/public/*
+ * 管理画面の API（/api/admin/*）はログインが要る（/api/auth/*）。応募者（ゲスト）の API（/api/public/*）はログインなし
  */
 import type { CalendarSettings, CalendarUpdateInput, LocationType, Question } from './schema';
 
@@ -17,6 +17,112 @@ export interface AppConfig {
   /** Google カレンダー連携が使えるか（GOOGLE_CLIENT_ID / SECRET が設定済み） */
   googleEnabled: boolean;
   emailProvider: string;
+}
+
+// ---- ログイン（管理画面だけ。docs/01「ログイン」） ----
+
+export interface AdminUserInfo {
+  id: string;
+  name: string;
+  email: string;
+}
+
+/**
+ * GET /api/auth/session。ログインのどの段階にいるか。step が 'done' になるまで /api/admin/* は 401。
+ * パスワード → 2段階認証（未登録なら登録）→ 仮パスワードなら変更 → done の順に進む
+ */
+export type AuthState =
+  | { step: 'setup' } // 管理者がまだ1人もいない。初期設定で最初の管理者を作る
+  | { step: 'login' }
+  | { step: 'mfa_enroll'; email: string } // パスワードは通った。認証アプリの登録が要る
+  | { step: 'mfa_verify'; email: string } // パスワードは通った。6桁のコードが要る
+  | { step: 'change_password'; user: AdminUserInfo } // 発行された仮パスワードのまま
+  | { step: 'done'; user: AdminUserInfo };
+
+/** POST /api/auth/setup（管理者が0人のときだけ） */
+export interface SetupInput {
+  setupToken: string;
+  name: string;
+  email: string;
+  password: string;
+}
+
+/** POST /api/auth/login */
+export interface LoginInput {
+  email: string;
+  password: string;
+}
+
+/** GET /api/auth/mfa/enroll。認証アプリに読み込ませる秘密鍵 */
+export interface MfaEnrollInfo {
+  /** 手入力用（base32） */
+  secret: string;
+  /** QR コードにする otpauth:// の URL */
+  otpauthUrl: string;
+}
+
+/** POST /api/auth/mfa/enroll・/api/auth/mfa/verify */
+export interface MfaCodeInput {
+  code: string;
+}
+
+/** POST /api/auth/password */
+export interface PasswordChangeInput {
+  currentPassword: string;
+  newPassword: string;
+}
+
+/** GET /api/admin/accounts の1件（管理画面にログインできる人） */
+export interface AccountInfo {
+  id: string;
+  name: string;
+  email: string;
+  mfaEnabled: boolean;
+  mustChangePassword: boolean;
+  lastLoginAt: string | null;
+  lastLoginIp: string | null;
+  createdAt: string;
+  isSelf: boolean;
+}
+
+/** POST /api/admin/accounts */
+export interface AccountInput {
+  name: string;
+  email: string;
+}
+
+/** アカウントの追加・パスワード再発行・2段階認証のやり直しの結果。仮パスワードはこの1回しか見られない */
+export interface TempPasswordResponse {
+  account: AccountInfo;
+  tempPassword: string;
+}
+
+export type AuthEventKind =
+  | 'setup'
+  | 'login_success'
+  | 'login_failed'
+  | 'login_locked'
+  | 'mfa_enrolled'
+  | 'mfa_failed'
+  | 'logout'
+  | 'password_changed'
+  | 'account_created'
+  | 'account_deleted'
+  | 'password_reset'
+  | 'mfa_reset';
+
+/** GET /api/admin/auth-events の1件 */
+export interface AuthEventItem {
+  id: number;
+  kind: AuthEventKind;
+  email: string | null;
+  /** 本人の名前（アカウントが消えていれば null） */
+  userName: string | null;
+  /** 操作した管理者の名前（アカウントの追加・リセットのとき） */
+  actorName: string | null;
+  ip: string | null;
+  userAgent: string | null;
+  createdAt: string;
 }
 
 // ---- メンバー（面接官） ----
